@@ -1,0 +1,6 @@
+.env
+state.json
+logs/
+trades.csv
+__pycache__/
+.pytest_cache/

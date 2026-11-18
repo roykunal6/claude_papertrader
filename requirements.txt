@@ -1,0 +1,4 @@
+requests>=2.31
+tzdata>=2024.1
+pyotp>=2.9      # only needed if you use the automatic TOTP login
+pytest>=8       # only needed to run the tests

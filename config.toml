@@ -1,0 +1,44 @@
+# Nifty options paper-trading bot: all the rules live here.
+# Change a number, save, and restart the bot. No code changes needed.
+
+[capital]
+total = 50000          # your total trading capital (for reporting only)
+max_invested = 30000   # the bot never spends more than this on one trade
+
+[timing]
+no_entry_before = "09:45"   # wait 30 minutes after the 09:15 open
+last_entry = "14:45"        # no new trades after this time
+square_off = "15:15"        # close any open trade at this time
+
+[trade]
+max_trades_per_day = 1
+target_pct = 15.0           # exit when the option is up 15%
+stop_loss_pct = 7.0         # exit when the option is down 7%  (PLEASE CONFIRM)
+exit_on_red_line = true     # cheat-sheet rule: exit if the 1-min line turns red and a candle closes below it
+skip_expiry_day = true      # no trading on Nifty expiry days
+strike_step = 50            # Nifty strikes are 50 points apart
+underlying = "NIFTY"
+
+[indicator]
+# Look-alike of TrendIkaterr. "ema" or "hma" (Hull, faster). Length 11 matches "TRENDIKATERR 11".
+method = "ema"
+length = 11
+# The index's own trend must agree: CE only when Nifty's line is blue, PE only when it's red.
+require_index_agreement = true
+# "Establish a trend first": Nifty's line must have held that colour for at least this many 1-min candles.
+index_trend_min_candles = 5
+
+[paper]
+slippage_pct = 0.3          # assume we buy 0.3% above and sell 0.3% below the last price
+
+[charges]                   # NSE options, per order
+brokerage_per_order = 10.0
+exchange_txn_pct = 0.03503
+sebi_fee_pct = 0.0001
+stt_sell_pct = 0.1
+stamp_buy_pct = 0.003
+gst_pct = 18.0
+
+[api]
+base_url = "https://api.indstocks.com"
+index_scrip = "NSE_40000001"  # NIFTY 50 index (check with: python run.py check)
