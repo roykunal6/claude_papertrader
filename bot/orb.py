@@ -45,7 +45,32 @@ def ema(values: list[float], length: int) -> list[float]:
     return out
 
 
+_PRIMED: dict = {}  # first candle ts -> 5-min bars of a whole replayed series (speeds up backtests)
+
+
+def prime(candles: list[dict]) -> None:
+    """Backtests: build the 5-min bars of a whole series once. Later five_minute() calls on any
+    beginning of that same series are answered from it instead of being rebuilt every minute."""
+    _PRIMED.clear()
+    if candles:
+        _PRIMED[candles[0]["ts"]] = _five_minute(candles)
+        _PRIMED["src"] = {c["ts"]: c["c"] for c in candles}
+
+
 def five_minute(candles: list[dict]) -> list[dict]:
+    if (candles and candles[0]["ts"] in _PRIMED
+            and _PRIMED["src"].get(candles[-1]["ts"]) == candles[-1]["c"] and len(candles) > 1
+            and _PRIMED["src"].get(candles[-2]["ts"]) == candles[-2]["c"]):
+        full = _PRIMED[candles[0]["ts"]]
+        upto = candles[-1]["ts"] + 60
+        n = len(full)
+        while n and full[n - 1]["ts"] + 300 > upto:
+            n -= 1
+        return full[:n]
+    return _five_minute(candles)
+
+
+def _five_minute(candles: list[dict]) -> list[dict]:
     """Group 1-min candles into 5-min candles aligned to 09:15 (09:15-09:20, 09:20-09:25, ...).
     Give it only finished 1-min candles; a 5-min candle is returned only once all its minutes are in
     (or a later minute exists, in case a minute is missing from the data)."""
@@ -164,22 +189,35 @@ def find_setup(cfg: dict, index_closed: list[dict], now: datetime,
     return Setup(opt, close, round(stop, 2), round(target, 2), round(risk, 2), reason), None
 
 
-def spot_exit(cfg: dict, pos, bar: dict) -> str | None:
+def spot_exit(cfg: dict, pos, bar: dict, section: str = "orb") -> str | None:
     """Check the latest finished 1-min Nifty candle against the trade's Nifty levels.
-    Moves the stop to the entry level once Nifty is 1x risk in profit. Returns an exit reason or None."""
+
+    Order: stop (on the candle's close), then target (if any), then move the stop:
+      * after breakeven_r x risk in profit: stop to the entry level
+      * after trail_start_r x risk in profit: stop trails trail_r x risk behind the best price (if trail_r > 0)
+    The stop never moves backwards. Returns an exit reason or None."""
     if not pos or not pos.spot_entry:
         return None
-    o = cfg["orb"]
+    o = cfg[section]
     sign = 1 if pos.contract.opt_type == "CE" else -1
-    # the breakout failed: Nifty closed back past the stop
     if (bar["c"] - pos.spot_stop) * sign <= 0:
+        if (pos.spot_stop - pos.spot_entry) * sign > 0.5:
+            return "TRAIL_STOP"
         return "BREAKEVEN_STOP" if pos.spot_stop_moved else "STOP_LOSS"
     best = bar["h"] if sign > 0 else bar["l"]
-    if (best - pos.spot_target) * sign >= 0:
+    if pos.spot_target and (best - pos.spot_target) * sign >= 0:
         return "TARGET"
-    be = pos.spot_entry + sign * o["breakeven_r"] * pos.risk_pts
-    if not pos.spot_stop_moved and (best - be) * sign >= 0:
-        pos.spot_stop = pos.spot_entry
+    pos.spot_best = best if not pos.spot_best else (max(pos.spot_best, best) if sign > 0 else min(pos.spot_best, best))
+    gain = (pos.spot_best - pos.spot_entry) * sign
+    new = pos.spot_stop
+    if gain >= o.get("breakeven_r", 1.0) * pos.risk_pts:
+        new = pos.spot_entry if sign > 0 and new < pos.spot_entry or sign < 0 and new > pos.spot_entry else new
+    if o.get("trail_r", 0) and gain >= o.get("trail_start_r", 1.0) * pos.risk_pts:
+        trail = pos.spot_best - sign * o["trail_r"] * pos.risk_pts
+        if (trail - new) * sign > 0:
+            new = trail
+    if (new - pos.spot_stop) * sign > 0:
+        pos.spot_stop = round(new, 2)
         pos.spot_stop_moved = True
     return None
 

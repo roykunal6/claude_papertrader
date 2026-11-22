@@ -34,10 +34,38 @@ chart, because the option's 1-minute chart is noisy and was causing 1 to 7 minut
    - **Target:** Nifty moves **2x the risk** in our favour
    - **Safety net:** the option itself falls 25%
    - **15:15** square-off
-6. One trade a day. No trading on expiry day. Nearest weekly expiry.
+6. One trade a day. Nearest weekly expiry (next week's on expiry day).
 
 Every number above is in `config.toml` (`[timing]`, `[trade]`, `[orb]`). Change it there.
 The old TrendIkaterr look-alike has been removed.
+
+## The second strategy: Trend-following (`name = "trend"` under `[strategy]`)
+
+Trades only when Nifty's trend is clear, and holds winners with a trailing stop.
+
+1. **Clear trend** on the 5-minute chart means: the 9-candle average is above the 21-candle average
+   (and the 21 is rising), ADX (a standard trend-strength gauge) is 22 or more, and Nifty is above today's open.
+   The mirror image is a clear downtrend. Anything else: no trade.
+2. **Entry:** when a clear trend starts, or when Nifty dips to its 9-candle average inside the trend and then
+   moves on again. Up-trend: buy the in-the-money **CALL**. Down-trend: the **PUT**.
+3. **Stop:** 1.5x the average 5-minute candle range. After 1x that risk in profit it moves to the entry level, then
+   **trails** 1.5x the risk behind the best price and never moves back. It also exits if the trend ends
+   (the averages cross back). There's no fixed target.
+4. Up to **3 trades a day**, but it stops for the day after 2 losing trades or ₹5,000 lost.
+
+## Expiry days
+`skip_expiry_day = false` trades on expiry days too. On those days it uses **next week's** contract
+(`expiry_day_contract = "next"`), because the expiring one can lose most of its value in minutes.
+
+## Which strategy is better? Compare them
+```
+python run.py compare 12months
+```
+This downloads each day once (into `data/cache`, so later runs take a minute), then tests every version on
+exactly the same days: the breakout as tested, the breakout with expiry days, the breakout with a trailing stop,
+and the trend strategy with 3 or 1 trades a day. It also runs an **honesty check**: it tries 27 trend settings on
+the earlier half of the year, picks the best, and shows how that pick did on the later half, which it never saw.
+If a version only looks good on the half it was picked on, that was luck.
 
 ## One-time setup (about 15 minutes)
 
@@ -82,7 +110,8 @@ Start it before 09:45 and leave the window open until about 15:17. It prints and
 
 Other commands:
 ```
-python run.py backtest 12months                # replay the last 12 months (as far back as INDstocks has data)
+python run.py compare 12months                 # test every strategy version on the same days (see above)
+python run.py backtest 12months                # replay the last 12 months with the strategy in config.toml
 python run.py backtest 2026-06-01 2026-11-20   # replay a date range, with a summary and backtest.csv
 python run.py replay 2026-11-19                # replay one past day, printing every decision
 python run.py debug-expired 2026-11-12         # if old weeks get "skipped", run this and send Claude the output

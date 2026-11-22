@@ -13,6 +13,7 @@ from .instruments import Contract, nearest_expiry, pick, pick_strike
 from .alerts import Alerter, contract_label
 from .broker import LiveBroker, tick
 from .market import load_contracts
+from .orb import is_five_min_close
 from .replay import closed_upto
 from .strategy import IST, Position, Strategy, Trade, hhmm
 
@@ -103,22 +104,25 @@ def _buy_alert(alert: Alerter, p, live: bool = False) -> None:
     alert.send("🟢 BOUGHT (real order)" if live else "🟢 BUY NOW",
                f"{contract_label(p.contract)}: {lots} lot(s), qty {p.qty}, around ₹{p.entry_price}. "
                f"I'll tell you when to sell: if Nifty closes {'below' if p.contract.opt_type == 'CE' else 'above'} "
-               f"{p.spot_stop:.0f} (stop), or reaches {p.spot_target:.0f} (profit), or the option falls to ₹{p.stop}.",
+               f"{p.spot_stop:.0f} (stop, it moves up as the trade goes your way), "
+               + (f"or reaches {p.spot_target:.0f} (profit), " if p.spot_target else "")
+               + f"or the option falls to ₹{p.stop}.",
                speak=("Bought. " if live else "Buy now. ") + f"Nifty {p.contract.strike:.0f} {'call' if p.contract.opt_type == 'CE' else 'put'}.")
 
 
 def _sell_alert(alert: Alerter, trade, live: bool = False) -> None:
-    why = {"TARGET": "Nifty reached the profit target", "STOP_LOSS": "breakout failed, stop hit",
+    why = {"TARGET": "Nifty reached the profit target", "STOP_LOSS": "stop hit",
+           "TRAIL_STOP": "trailing stop hit, profit locked", "TREND_END": "the trend has ended",
            "BREAKEVEN_STOP": "Nifty came back to the entry level", "OPTION_STOP": "option safety stop hit",
            "TIME_3:15": "3:15 PM square-off", "MANUAL_STOP": "you asked it to stop"}.get(trade.exit_reason, trade.exit_reason)
     if live:
         alert.send("🔴 SOLD (real order)",
                    f"Sold all {trade.qty} qty {trade.symbol} ({why}) at ₹{trade.exit_price}. "
-                   f"P&L about ₹{trade.net_pnl:,.0f} after charges. Done for today.", speak="Sold.")
+                   f"P&L about ₹{trade.net_pnl:,.0f} after charges.", speak="Sold.")
         return
     alert.send("🔴 SELL NOW",
                f"Sell ALL {trade.qty} qty {trade.symbol} ({why}), around ₹{trade.exit_price}. "
-               f"P&L ₹{trade.net_pnl:,.0f} after charges. Done for today.",
+               f"P&L ₹{trade.net_pnl:,.0f} after charges.",
                speak="Sell now.")
 
 
@@ -139,9 +143,13 @@ def run_live(cfg: dict, live: bool = False) -> None:
         log("Couldn't find Nifty option contracts in the instrument list. Stopping.")
         return
     log(f"Loaded {len(contracts)} Nifty option contracts. Nearest expiry {expiry}.")
-    if cfg["trade"]["skip_expiry_day"] and expiry == today:
-        log("Today is a Nifty expiry day. No trading today (your rule).")
-        return
+    if expiry == today:
+        if cfg["trade"]["skip_expiry_day"]:
+            log("Today is a Nifty expiry day. No trading today (your rule).")
+            return
+        if cfg["trade"].get("expiry_day_contract", "next") == "next":
+            expiry = nearest_expiry(contracts, today + timedelta(days=1))
+            log(f"Expiry day: trading next week's contract (expiry {expiry}) instead of today's.")
     if today.weekday() >= 5:
         log("Weekend. Market closed.")
         return
@@ -206,7 +214,8 @@ def run_live(cfg: dict, live: bool = False) -> None:
     range_told = False
     stop_file = ROOT / "STOP"
     alert.send("✅ Bot is running", f"{'LIVE trading (real money)' if live else 'Paper trading'} Nifty options today ({today}). "
-               f"I'll watch Nifty from 9:15 to {cfg['orb']['range_end']}, then tell you exactly when to buy and sell.")
+               + (f"I'll watch Nifty from 9:15 to {cfg['orb']['range_end']}, then tell you exactly when to buy and sell."
+                if strat.name == "orb" else "I'll only trade if Nifty shows a clear trend, and tell you exactly when to buy and sell."))
 
     def buy_live(contract, ltp: float, now: datetime, setup) -> None:
         strat.trades_today += 1  # the day's one signal is used, whatever happens next
@@ -261,7 +270,7 @@ def run_live(cfg: dict, live: bool = False) -> None:
                     cache.refresh([idx], now)
                 index_c = closed_upto(cache.data.get(idx, []), close_ts)
                 today_c = [c for c in index_c if datetime.fromtimestamp(c["ts"], IST).date() == today]
-                if not range_told and now.time() >= range_end and today_c:
+                if not range_told and strat.name == "orb" and now.time() >= range_end and today_c:
                     range_told = True
                     from .orb import opening_range, range_problem
                     rng = opening_range(today_c, range_end)
@@ -273,8 +282,13 @@ def run_live(cfg: dict, live: bool = False) -> None:
                                       f"I'll buy a CALL if Nifty breaks above {rng.high:.0f}, "
                                       f"a PUT if it breaks below {rng.low:.0f}. Nothing to do until then."))
                 if strat.position and today_c:
-                    why = strat.index_exit(today_c[-1])
+                    before = strat.position.spot_stop
+                    why = strat.index_exit(today_c[-1], index_c, minute)
                     state.save(strat)
+                    if not why and strat.position.spot_stop != before:
+                        alert.send("⬆️ Stop moved", f"{strat.position.contract.symbol}: now exits if Nifty closes "
+                                   f"{'below' if strat.position.contract.opt_type == 'CE' else 'above'} "
+                                   f"{strat.position.spot_stop:.0f}. Nothing to do.")
                     if why:
                         s = strat.position.contract.scrip
                         do_exit(client.ltp([s]).get(s) or strat.position.entry_price, now, why)
@@ -282,7 +296,7 @@ def run_live(cfg: dict, live: bool = False) -> None:
                     if not today_c:
                         log("No Nifty index candles yet.")
                     else:
-                        setup = strat.entry_signal(now, index_c)
+                        setup = strat.entry_signal(now, index_c) if is_five_min_close(minute) else None
                         if setup:
                             k = pick_strike(setup.spot, setup.opt_type, step, strike_mode)
                             contract = pick(contracts, expiry, k, setup.opt_type)
@@ -311,7 +325,7 @@ def run_live(cfg: dict, live: bool = False) -> None:
         do_exit(ltp, datetime.now(IST), getattr(p, "pending_exit", None) or "TIME_3:15")
     total = sum(t.net_pnl for t in strat.closed)
     if strat.trades_today == 0:
-        alert.send("😴 No trade today", "No clean breakout today, so no trade. That's the plan working: no trade is better than a bad trade.")
+        alert.send("😴 No trade today", "No clean signal today, so no trade. That's the plan working: no trade is better than a bad trade.")
     else:
         alert.send("🏁 Day done", f"Trades: {len(strat.closed)}. Net P&L ₹{total:,.0f} after charges.")
     log(f"Log saved: {log.path}")

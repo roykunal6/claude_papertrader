@@ -5,17 +5,27 @@
 total = 50000          # your total trading capital (for reporting only)
 max_invested = 30000   # the bot never spends more than this on one trade
 
+[strategy]
+# "orb"   = Opening Range Breakout: at most 1 trade a day, on a clean break of the 09:15-09:45 range.
+# "trend" = Trend-following: only in a clear trend, up to 3 trades a day, trailing stop, no fixed target.
+# Run  python run.py compare 12months  to see how each one did on the same days before you choose.
+name = "orb"
+
 [timing]
 no_entry_before = "09:45"   # nothing before the opening range (09:15-09:45) is complete
 last_entry = "13:30"        # no new trades after this: late breakouts have little time left to work
 square_off = "15:15"        # close any open trade at this time
 
 [trade]
-max_trades_per_day = 1
+max_trades_per_day = 1      # the trend strategy has its own limit in [trend]
+max_losing_trades_per_day = 2   # stop for the day after this many losing trades
+max_daily_loss = 5000       # stop for the day once this much is lost (₹)
 max_loss_per_trade = 2500   # size the trade so that a stop-out loses about this much at most (₹)
+delta_guess = 0.6           # how much an in-the-money option moves per Nifty point (for sizing only)
 max_lots = 99               # hard cap on lots, whatever the money allows
 stop_loss_pct = 25.0        # safety net: exit if the OPTION itself falls 25% (normally the Nifty stop comes first)
-skip_expiry_day = true      # no trading on Nifty expiry days
+skip_expiry_day = false     # true = no trading on Nifty expiry days
+expiry_day_contract = "next"   # on expiry day, trade next week's contract ("next") or the expiring one ("same")
 strike_step = 50            # Nifty strikes are 50 points apart
 # "itm": buy the nearest in-the-money strike at the moment of entry (recommended).
 # "atm": buy the strike nearest Nifty.
@@ -32,9 +42,28 @@ use_ema_filter = true       # and on the right side of its 20-candle average (tr
 ema_length = 20
 stop_at = "mid"             # "mid": stop if Nifty closes back past the middle of the range. "opposite": other side.
 max_risk_pts = 90           # skip a breakout that is already this far from its stop (don't chase)
-target_r = 2.0              # book profit when Nifty has moved 2x the risk in our favour
+target_r = 2.0              # book profit when Nifty has moved 2x the risk in our favour (0 = no target)
 breakeven_r = 1.0           # after 1x the risk in our favour, the stop moves to the entry level
-delta_guess = 0.6           # how much an in-the-money option moves per Nifty point (for sizing only)
+trail_start_r = 1.0         # after this much profit (x risk), the stop starts trailing...
+trail_r = 0                 # ...this far (x risk) behind the best Nifty price. 0 = no trailing (fixed target only)
+
+[trend]
+# Trend-following on Nifty's 5-min chart. Only trades when the trend is clear.
+max_trades_per_day = 3
+ema_fast = 9                # fast average (candles)
+ema_slow = 21               # slow average (candles)
+adx_len = 14
+adx_min = 22                # ADX "trend strength": below this the market is choppy, no trade
+atr_len = 14
+stop_atr = 1.5              # first stop = 1.5x the average 5-min candle range from the entry
+min_risk_pts = 25
+max_risk_pts = 90           # skip if the stop would be further than this (too jumpy)
+enter_on_fresh_trend = true # enter when a clear trend starts (as well as on dips inside a trend)
+target_r = 0                # 0 = no fixed target: ride the trend with the trailing stop
+breakeven_r = 1.0           # after 1x the risk in profit, the stop moves to the entry level
+trail_start_r = 1.0         # then trails...
+trail_r = 1.5               # ...1.5x the risk behind the best Nifty price, never moving back
+exit_on_trend_end = true    # also exit when the 9-avg crosses back over the 21-avg
 
 [alerts]
 mac_popup = true         # pop-up with a sound on your Mac

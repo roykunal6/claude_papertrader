@@ -15,7 +15,8 @@ from datetime import datetime
 
 from .costs import order_charges
 from .instruments import Contract
-from .orb import IST, Setup, find_setup, hhmm, spot_exit
+from . import orb, trend
+from .orb import IST, Setup, hhmm, spot_exit
 
 __all__ = ["IST", "Position", "Strategy", "Trade", "hhmm"]
 
@@ -42,6 +43,7 @@ class Position:
     spot_target: float = 0.0    # Nifty level that books the profit
     risk_pts: float = 0.0
     spot_stop_moved: bool = False
+    spot_best: float = 0.0      # best Nifty level since entry (for the trailing stop)
 
 
 @dataclass
@@ -92,7 +94,7 @@ class Strategy:
         lots = min(lots, tr.get("max_lots", 99))
         max_loss = tr.get("max_loss_per_trade")
         if max_loss and risk_pts:
-            delta = self.cfg["orb"].get("delta_guess", 0.6)
+            delta = self.cfg["trade"].get("delta_guess", 0.6)
             per_unit = min(risk_pts * delta, price * tr["stop_loss_pct"] / 100)
             per_unit += price * 2 * self.cfg["paper"]["slippage_pct"] / 100
             lots = min(lots, math.floor(max_loss / (per_unit * lot_size)))
@@ -109,31 +111,45 @@ class Strategy:
         return tick(price * (1 + s) if side == "BUY" else price * (1 - s))
 
     # ---------------- decisions ----------------
+    @property
+    def name(self) -> str:
+        return self.cfg.get("strategy", {}).get("name", "orb")
+
+    def day_pnl(self) -> float:
+        return sum(t.net_pnl for t in self.closed)
+
     def can_enter(self, now: datetime) -> bool:
         t = now.astimezone(IST).time()
+        tr = self.cfg["trade"]
+        losses = sum(1 for x in self.closed if x.net_pnl <= 0)
         return (self.position is None
-                and self.trades_today < self.cfg["trade"]["max_trades_per_day"]
+                and self.trades_today < self.cfg.get(self.name, {}).get("max_trades_per_day", tr["max_trades_per_day"])
+                and losses < tr.get("max_losing_trades_per_day", 99)
+                and self.day_pnl() > -tr.get("max_daily_loss", 10**9)
                 and self._t("no_entry_before") <= t <= self._t("last_entry"))
 
     def entry_signal(self, now: datetime, index_closed: list[dict]) -> Setup | None:
         """Called once per finished 1-min candle with Nifty's finished 1-min candles."""
         if not self.can_enter(now):
             return None
-        setup, note = find_setup(self.cfg, index_closed, now, self._seen_bars)
+        mod = trend if self.name == "trend" else orb
+        setup, note = mod.find_setup(self.cfg, index_closed, now, self._seen_bars)
         if note:
             self.note(note)
         return setup
 
-    def index_exit(self, bar: dict) -> str | None:
-        """Nifty-based exit on the latest finished 1-min Nifty candle (stop, breakeven stop, target)."""
+    def index_exit(self, bar: dict, index_closed: list[dict] | None = None,
+                   now: datetime | None = None) -> str | None:
+        """Nifty-based exit on the latest finished 1-min Nifty candle (stop, trailing stop, target, trend end)."""
         p = self.position
         if not p:
             return None
-        was_moved = p.spot_stop_moved
-        why = spot_exit(self.cfg, p, bar)
-        if p.spot_stop_moved and not was_moved:
-            self.log(f"Nifty reached {p.spot_entry + (1 if p.contract.opt_type == 'CE' else -1) * p.risk_pts:.0f}: "
-                     f"stop moved to the entry level {p.spot_stop:.0f}. This trade can no longer lose much.")
+        before = p.spot_stop
+        why = spot_exit(self.cfg, p, bar, self.name)
+        if not why and p.spot_stop != before:
+            self.log(f"Nifty stop moved {before:.0f} -> {p.spot_stop:.0f} (best so far {p.spot_best:.0f}).")
+        if not why and self.name == "trend" and index_closed and now and trend.trend_over(self.cfg, p, index_closed, now):
+            why = "TREND_END"
         return why
 
     # ---------------- fills ----------------
@@ -150,18 +166,20 @@ class Strategy:
                      f"₹{self.cfg['trade'].get('max_loss_per_trade', 0):,}. No trade today.")
             return None
         tr = self.cfg["trade"]
-        delta = self.cfg["orb"].get("delta_guess", 0.6)
+        delta = self.cfg["trade"].get("delta_guess", 0.6)
         stop = tick(price * (1 - tr["stop_loss_pct"] / 100))
         self.position = Position(
             contract=contract, qty=qty, entry_price=price, entry_time=now,
-            target=tick(price + abs(setup.target - setup.spot) * delta), stop=stop,
+            target=tick(price + abs(setup.target - setup.spot) * delta) if setup.target else 0.0, stop=stop,
             entry_charges=order_charges(price * qty, "BUY", self.cfg["charges"]), reason=setup.reason,
             peak=price, initial_stop=stop, spot_entry=setup.spot, spot_stop=setup.stop,
-            spot_target=setup.target, risk_pts=setup.risk_pts)
+            spot_target=setup.target, risk_pts=setup.risk_pts, spot_best=setup.spot)
         p = self.position
         self.log(f"{now:%H:%M:%S} {'LIVE' if live else 'PAPER'} BUY {qty} x {contract.symbol} @ ₹{price} "
                  f"(₹{price * qty:,.0f}). Exit if Nifty closes {'below' if contract.opt_type == 'CE' else 'above'} "
-                 f"{p.spot_stop:.0f}, book profit at Nifty {p.spot_target:.0f}, safety stop ₹{p.stop}. "
+                 f"{p.spot_stop:.0f} (trailing), "
+                 + (f"book profit at Nifty {p.spot_target:.0f}, " if p.spot_target else "")
+                 + f"safety stop ₹{p.stop}. "
                  f"Why: {setup.reason}")
         return p
 
