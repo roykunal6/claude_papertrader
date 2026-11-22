@@ -41,15 +41,6 @@ mac_popup = true         # pop-up with a sound on your Mac
 mac_voice = true         # your Mac says "Buy now" / "Sell now" out loud
 # Telegram: put TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env (see README)
 
-[indicator]
-# Look-alike of TrendIkaterr. "ema" or "hma" (Hull, faster). Length 11 matches "TRENDIKATERR 11".
-method = "ema"
-length = 11
-# The index's own trend must agree: CE only when Nifty's line is blue, PE only when it's red.
-require_index_agreement = true
-# "Establish a trend first": Nifty's line must have held that colour for at least this many 1-min candles.
-index_trend_min_candles = 5
-
 [live]
 # REAL MONEY. Leave this false until you've watched paper trading for a while.
 # Even when true, the bot only trades live if you run `python run.py live`
