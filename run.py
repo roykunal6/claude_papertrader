@@ -4,6 +4,7 @@
   python run.py paper                 run today's live paper trading (start before 09:15)
   python run.py replay 2026-11-19     replay a past day with the same rules
   python run.py backtest 2026-11-16 2026-11-20   replay every day in a date range, with a summary
+  python run.py export 2026-11-20     save that day's Nifty 1-min candles to a CSV
   python run.py debug                 print raw API answers to help fix data problems
   python run.py demo                  run on a made-up day, no API needed
 """
@@ -202,6 +203,25 @@ def cmd_debug(cfg: dict) -> None:
     print("\nDone. Copy everything above and send it to Claude. It contains no token or account details.")
 
 
+def cmd_export(cfg: dict, day: date) -> None:
+    """Save that day's Nifty 1-min candles to a CSV, to compare against the INDstocks chart."""
+    import csv
+    from bot.indstocks import IndstocksClient
+    from bot.replay import day_window_ms
+    from bot.strategy import IST
+    client = IndstocksClient.from_env(cfg["api"]["base_url"])
+    idx = cfg["api"]["index_scrip"]
+    start, end = day_window_ms(day, warmup_days=4)
+    rows = client.candles([idx], start, end).get(idx, [])
+    out = ROOT / f"nifty_{day:%Y-%m-%d}.csv"
+    with out.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["time_ist", "open", "high", "low", "close", "volume"])
+        for c in rows:
+            w.writerow([f"{datetime.fromtimestamp(c['ts'], IST):%Y-%m-%d %H:%M}", c["o"], c["h"], c["l"], c["c"], c["v"]])
+    print(f"Saved {len(rows)} candles (that day plus 4 days before, for warm-up) to {out}")
+
+
 def cmd_demo(cfg: dict) -> None:
     from tests.fake_market import make_day
     from bot.replay import simulate_day
@@ -229,6 +249,8 @@ def main(argv: list[str]) -> None:
         cmd_backtest(cfg, date.fromisoformat(argv[2]), date.fromisoformat(argv[3]))
     elif cmd == "debug":
         cmd_debug(cfg)
+    elif cmd == "export" and len(argv) > 2:
+        cmd_export(cfg, date.fromisoformat(argv[2]))
     elif cmd == "demo":
         cmd_demo(cfg)
     else:

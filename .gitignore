@@ -5,3 +5,4 @@ trades.csv
 __pycache__/
 .pytest_cache/
 backtest.csv
+nifty_*.csv
