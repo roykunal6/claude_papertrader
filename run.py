@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import os
 import sys
-import tomllib
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:  # Python 3.9 / 3.10 (e.g. macOS's built-in python3)
+    import tomli as tomllib
 from datetime import date, datetime
 from pathlib import Path
 

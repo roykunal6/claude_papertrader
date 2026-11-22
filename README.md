@@ -29,10 +29,10 @@ If they don't match well, change `method` (try `"hma"`) or `length` in `config.t
 
 ## One-time setup (about 15 minutes)
 
-1. **Install Python 3.11 or newer** from python.org (on Windows, tick "Add Python to PATH").
+1. **Python 3.9 or newer.** A Mac's built-in `python3` works. On Windows, install from python.org and tick "Add Python to PATH".
 2. Open a terminal in this folder and run:
    ```
-   pip install -r requirements.txt
+   python3 -m pip install -r requirements.txt
    ```
 3. **Turn on API access** on the INDstocks website: go to *API Trading → Access tokens*.
 4. Copy `.env.example` to a new file named `.env` in this folder, and paste your access token after
