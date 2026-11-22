@@ -1,3 +1,4 @@
+import math
 import sys
 try:
     import tomllib  # Python 3.11+
@@ -137,12 +138,13 @@ def test_charges_reasonable():
     assert 10 < buy < 30 and 35 < sell < 60
 
 
-def test_expiry_day_skipped():
-    day, idx, opt, contracts, expiry = make_day(seed=7)
+def test_expiry_day_skipped_when_switched_on():
+    c = cfg()
+    c["trade"]["skip_expiry_day"] = True
+    day, idx, opt, contracts, expiry = make_day(path=orb_path(up=True))
     logs = []
-    assert simulate_day(cfg(), day, idx, opt, contracts, day, log=logs.append) == []
+    assert simulate_day(c, day, idx, opt, contracts, day, log=logs.append) == []
     assert "expiry" in logs[0]
-
 
 def test_instrument_csv_parsing():
     header = ("EXCH,SEGMENT,SECURITY_ID,INSTRUMENT_NAME,EXPIRY_CODE,TRADING_SYMBOL,LOT_UNITS,CUSTOM_SYMBOL,"
@@ -270,3 +272,101 @@ def test_backtest_uses_expired_contract_api_for_old_weeks():
     trades, note = R.replay_day(c, Client(), [], day, log=lambda m: None)   # no live contracts at all
     assert note == "traded" and len(trades) == 1, note
     assert any("historical/expired" in p for p in Client.calls)
+
+
+# ---------------- trend-following ----------------
+def _with_previous_day(idx, base):
+    prev = []
+    for i, c in enumerate(idx):
+        wob = 6 * math.sin(i / 3)
+        prev.append({"ts": c["ts"] - 86400, "o": base + wob, "h": base + wob + 3, "l": base + wob - 3,
+                     "c": base + wob, "v": 0})
+    return prev + idx
+
+
+def trend_cfg():
+    c = cfg()
+    c["strategy"]["name"] = "trend"
+    return c
+
+
+def test_trend_buys_calls_in_an_uptrend_and_trails():
+    path = [25200.0 + 1.2 * i + 8 * math.sin(i / 6) for i in range(375)]
+    day, idx, opt, contracts, expiry = make_day(path=path)
+    logs = []
+    trades = simulate_day(trend_cfg(), day, _with_previous_day(idx, 25200.0), opt, contracts, expiry, log=logs.append)
+    assert trades, logs
+    assert all(t.opt_type == "CE" for t in trades)
+    assert len(trades) <= 3
+    assert sum(t.net_pnl for t in trades) > 0
+    assert any("stop moved" in m for m in logs)
+
+
+def test_trend_buys_puts_in_a_downtrend():
+    path = [25200.0 - 1.2 * i + 8 * math.sin(i / 6) for i in range(375)]
+    day, idx, opt, contracts, expiry = make_day(path=path)
+    trades = simulate_day(trend_cfg(), day, _with_previous_day(idx, 25200.0), opt, contracts, expiry, log=quiet())
+    assert trades and all(t.opt_type == "PE" for t in trades)
+
+
+def test_trend_stays_out_of_a_choppy_day():
+    path = [25200.0 + 25 * math.sin(i / 4) for i in range(375)]
+    day, idx, opt, contracts, expiry = make_day(path=path)
+    assert simulate_day(trend_cfg(), day, _with_previous_day(idx, 25200.0), opt, contracts, expiry, log=quiet()) == []
+
+
+def test_trailing_stop_never_moves_back():
+    from bot.orb import Setup, spot_exit
+    c = trend_cfg()
+    s = Strategy(c, log=quiet())
+    day, idx, opt, contracts, expiry = make_day(path=orb_path(up=True))
+    p = s.open(contracts[0], 100.0, datetime(2026, 11, 19, 11, 0, tzinfo=IST), Setup("CE", 25000.0, 24970.0, 0.0, 30.0, "t"))
+    assert spot_exit(c, p, {"h": 25020, "l": 25000, "c": 25015}, "trend") is None and p.spot_stop == 24970.0
+    assert spot_exit(c, p, {"h": 25031, "l": 25010, "c": 25025}, "trend") is None and p.spot_stop == 25000.0  # +1R
+    assert spot_exit(c, p, {"h": 25100, "l": 25060, "c": 25090}, "trend") is None
+    assert p.spot_stop == 25100 - 45                                   # trails 1.5R behind the best
+    assert spot_exit(c, p, {"h": 25080, "l": 25060, "c": 25070}, "trend") is None and p.spot_stop == 25055
+    assert spot_exit(c, p, {"h": 25060, "l": 25040, "c": 25050}, "trend") == "TRAIL_STOP"
+
+
+def test_daily_loss_limits_stop_new_trades():
+    from bot.strategy import Trade
+    s = Strategy(trend_cfg(), log=quiet())
+    now = datetime(2026, 11, 19, 11, 0, tzinfo=IST)
+    assert s.can_enter(now)
+    s.closed = [Trade("2026-11-19", "X", "CE", 1, 65, "10:00", 1, "10:10", 1, "STOP_LOSS", -1, 0, -1000, "")] * 2
+    assert not s.can_enter(now)   # 2 losing trades: done for the day
+    s.closed = [Trade("2026-11-19", "X", "CE", 1, 65, "10:00", 1, "10:10", 1, "STOP_LOSS", -1, 0, -5200, "")]
+    assert not s.can_enter(now)   # over the ₹5,000 daily loss limit
+
+
+# ---------------- compare command (offline, from cached-style day data) ----------------
+def test_compare_runs_every_version_and_the_walk_forward_check(tmp_path):
+    import gzip
+    import json
+    from dataclasses import asdict
+    from datetime import timedelta
+    import run as R
+    from bot import compare
+    days = []
+    for n in range(8):
+        d = date(2026, 11, 2) + timedelta(days=n + 2 * (n // 5))
+        kind = n % 4
+        path = (orb_path(up=True) if kind == 0 else orb_path(up=False) if kind == 1 else
+                orb_path(up=True, fail=True) if kind == 2 else [25200.0 + 25 * math.sin(i / 4) for i in range(375)])
+        _, idx, opt, contracts, expiry = make_day(path=path, day=d)
+        data = {"day": d.isoformat(), "index": _with_previous_day(idx, 25200.0), "note": None,
+                "chains": {expiry.isoformat(): {"expired": False, "candles": opt,
+                           "contracts": [dict(asdict(c), expiry=c.expiry.isoformat()) for c in contracts]}}}
+        # round-trip through the cache format
+        f = tmp_path / f"{d}.json.gz"
+        with gzip.open(f, "wt") as fh:
+            json.dump(data, fh)
+        with gzip.open(f, "rt") as fh:
+            days.append((d, json.load(fh)))
+    logs = []
+    rows = compare.compare(cfg(), days, R.run_day, log=logs.append)
+    text = "\n".join(logs)
+    assert "ORB as tested" in text and "Trend, 3 trades/day" in text and "honesty check" in text
+    orb_whole = next(r for r in rows if r["version"].startswith("ORB as tested") and r["period"] == "whole")
+    assert orb_whole["trades"] >= 4

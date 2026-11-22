@@ -8,6 +8,7 @@
   python run.py backtest 2026-11-09 2026-11-20   replay every day in a date range, with a summary
                                       (expired weekly contracts are fetched too)
   python run.py backtest 12months     the same, for the last 12 months (or 3months, 6months...)
+  python run.py compare 12months      test every strategy version on the same days, with an honesty check
   python run.py export 2026-11-20     save that day's Nifty 1-min candles to a CSV
   python run.py export 2026-11-20 25400 PE   same, for one option
   python run.py test-alert            send a test alert (Mac pop-up, voice, Telegram)
@@ -101,41 +102,101 @@ def _expired_chain(cfg: dict, client, day: date):
     return exp, _EXPIRED[exp]
 
 
-def replay_day(cfg: dict, client, contracts, day: date, log=print):
-    """Replay one past day. Returns (trades, note). Works for expired weeklies too."""
+def _chain_for(cfg: dict, client, contracts, d: date):
+    """(expiry, chain, expired) for the nearest weekly expiry on or after d. Raises on API trouble."""
+    from bot.instruments import nearest_expiry
+    expiry = nearest_expiry(contracts, d)
+    if expiry is not None and (expiry - d).days < 7:
+        return expiry, contracts, False
+    old_exp, old_chain = _expired_chain(cfg, client, d)  # that week has expired: use the expired-contracts API
+    if not old_chain:
+        raise LookupError(f"no expired contract list for that week (run: python run.py debug-expired {d})")
+    return old_exp, old_chain, True
+
+
+def load_day(cfg: dict, client, contracts, day: date, cache_dir: Path | None = None) -> dict:
+    """Download everything one past day needs: Nifty candles (with 4 days before, to warm up the averages),
+    and 1-min candles of every in-the-money strike Nifty touched, for that day's weekly expiry
+    (and next week's too on an expiry day). Saved to cache_dir so later runs don't download again."""
+    import gzip
+    import json
+    from dataclasses import asdict
+    from datetime import timedelta
     from bot.indstocks import expired_candles
-    from bot.instruments import nearest_expiry, pick
-    from bot.replay import day_window_ms, simulate_day, strikes_needed
+    from bot.instruments import pick
+    from bot.replay import day_window_ms, strikes_needed
     from bot.strategy import IST
-    if day.weekday() >= 5:
-        return [], "weekend"
+    path = cache_dir / f"{day}.json.gz" if cache_dir else None
+    if path and path.exists():
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            return json.load(f)
     start, end = day_window_ms(day)
+    day_start, _ = day_window_ms(day, warmup_days=0)
     idx = cfg["api"]["index_scrip"]
     index_c = client.candles([idx], start, end).get(idx, [])
     today_c = [c for c in index_c if datetime.fromtimestamp(c["ts"], IST).date() == day]
+    data = {"day": day.isoformat(), "index": index_c, "chains": {}, "note": None}
     if not today_c:
-        return [], "no market data (holiday?)"
-    # The contract the bot would have traded is the nearest weekly expiry on or after that day.
-    expiry, chain, expired = nearest_expiry(contracts, day), contracts, False
-    if expiry is None or (expiry - day).days >= 7:  # that day's weekly has expired: use the expired-contracts API
-        try:
-            old_exp, old_chain = _expired_chain(cfg, client, day)
-        except Exception as e:  # noqa: BLE001
-            return [], f"skipped: couldn't load that day's expired contract ({e.__class__.__name__}: {str(e)[:200]})"
-        if not old_chain:
-            return [], (f"skipped: no expired contract list for that week (run: python run.py debug-expired {day})")
-        expiry, chain, expired = old_exp, old_chain, True
-    if cfg["trade"]["skip_expiry_day"] and day == expiry:
-        return [], "expiry day, no trading"
-    needed = [c for k in strikes_needed(today_c, cfg["trade"]["strike_step"])
-              for t in ("CE", "PE") if (c := pick(chain, expiry, k, t))]
-    scrips = [c.scrip for c in needed]
-    opt_c = expired_candles(client, scrips, start, end) if expired else client.candles(scrips, start, end)
-    if not any(opt_c.values()):
-        return [], ("skipped: no option candles came back for that day"
-                    + (f" (run: python run.py debug-expired {day})" if expired else ""))
-    trades = simulate_day(cfg, day, index_c, opt_c, chain, expiry, log=log)
-    return trades, "traded" if trades else "no trade (no clean breakout)"
+        data["note"] = "no market data (holiday?)"
+    else:
+        ks = strikes_needed(today_c, cfg["trade"]["strike_step"])
+        expiry, chain, expired = _chain_for(cfg, client, contracts, day)
+        todo = [(expiry, chain, expired)]
+        if expiry == day:
+            todo.append(_chain_for(cfg, client, contracts, day + timedelta(days=1)))
+        for exp, ch, was_expired in todo:
+            needed = [c for k in ks for t in ("CE", "PE") if (c := pick(ch, exp, k, t))]
+            scrips = [c.scrip for c in needed]
+            got = expired_candles(client, scrips, day_start, end) if was_expired else client.candles(scrips, day_start, end)
+            data["chains"][exp.isoformat()] = {
+                "expired": was_expired,
+                "contracts": [dict(asdict(c), expiry=c.expiry.isoformat()) for c in needed],
+                "candles": {k: v for k, v in got.items() if v}}
+        if not any(ch["candles"] for ch in data["chains"].values()):
+            raise LookupError("no option candles came back for that day"
+                              + (f" (run: python run.py debug-expired {day})" if expired else ""))
+    if path and (data["note"] or day < date.today()):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with gzip.open(path, "wt", encoding="utf-8") as f:
+            json.dump(data, f)
+    return data
+
+
+def run_day(cfg: dict, data: dict, day: date, log=print):
+    """Replay one day from load_day's data with the rules in cfg. Returns (trades, note)."""
+    from bot.instruments import Contract
+    from bot.replay import simulate_day
+    if data.get("note"):
+        return [], data["note"]
+    exps = sorted(date.fromisoformat(e) for e in data["chains"])
+    expiry = exps[0]
+    if expiry == day:
+        if cfg["trade"]["skip_expiry_day"]:
+            return [], "expiry day, no trading"
+        if cfg["trade"].get("expiry_day_contract", "next") == "next":
+            if len(exps) < 2:
+                return [], "skipped: no data for next week's contract"
+            expiry = exps[1]
+    ch = data["chains"][expiry.isoformat()]
+    chain = [Contract(**dict(c, expiry=date.fromisoformat(c["expiry"]))) for c in ch["contracts"]]
+    trades = simulate_day(cfg, day, data["index"], ch["candles"], chain, expiry, log=log)
+    return trades, "traded" if trades else "no trade (no clean signal)"
+
+
+def replay_day(cfg: dict, client, contracts, day: date, log=print, cache_dir: Path | None = None):
+    """Replay one past day. Returns (trades, note). Works for expired weeklies too."""
+    if day.weekday() >= 5:
+        return [], "weekend"
+    try:
+        data = load_day(cfg, client, contracts, day, cache_dir)
+    except LookupError as e:
+        return [], f"skipped: {e}"
+    except Exception as e:  # noqa: BLE001
+        return [], f"skipped: couldn't load that day's data ({e.__class__.__name__}: {str(e)[:200]})"
+    return run_day(cfg, data, day, log)
+
+
+CACHE = ROOT / "data" / "cache"
 
 
 def _client_and_contracts(cfg: dict):
@@ -204,13 +265,13 @@ def cmd_backtest(cfg: dict, first: date, last: date) -> None:
     from datetime import timedelta
     client, contracts = _client_and_contracts(cfg)
     rows, notes, day = [], {}, first
-    print(f"Backtest {first} to {last}: Opening Range Breakout, same rules as live, "
+    print(f"Backtest {first} to {last}: strategy \"{cfg.get('strategy', {}).get('name', 'orb')}\", same rules as live, "
           "paper fills with slippage and charges")
     print("-" * 70)
     while day <= last:
         if day.weekday() < 5:
             try:
-                trades, note = replay_day(cfg, client, contracts, day, log=lambda m: None)
+                trades, note = replay_day(cfg, client, contracts, day, log=lambda m: None, cache_dir=CACHE)
             except Exception as e:  # noqa: BLE001  keep going: one bad day shouldn't stop a long backtest
                 trades, note = [], f"skipped: error {e.__class__.__name__}: {str(e)[:150]}"
             print(f"{day} {day:%a}: {note}", flush=True)
@@ -230,6 +291,40 @@ def cmd_backtest(cfg: dict, first: date, last: date) -> None:
             w.writeheader()
             w.writerows(rows)
         print(f"Every trade saved to {out}")
+
+
+def cmd_compare(cfg: dict, first: date, last: date) -> None:
+    """Download each day once (cached in data/cache), then test every strategy version on the same days."""
+    import csv
+    from datetime import timedelta
+    from bot import compare
+    client, contracts = _client_and_contracts(cfg)
+    days, skipped, day = [], {}, first
+    print(f"Loading {first} to {last} (first run downloads; later runs read data/cache and are fast)...")
+    while day <= last:
+        if day.weekday() < 5:
+            try:
+                data = load_day(cfg, client, contracts, day, CACHE)
+                if data.get("note"):
+                    skipped[data["note"]] = skipped.get(data["note"], 0) + 1
+                else:
+                    days.append((day, data))
+            except Exception as e:  # noqa: BLE001
+                key = f"skipped ({e.__class__.__name__})"
+                skipped[key] = skipped.get(key, 0) + 1
+                print(f"  {day}: {str(e)[:150]}")
+        day += timedelta(days=1)
+    print(f"Trading days with data: {len(days)}. Not used: "
+          + (", ".join(f"{k}: {v}" for k, v in skipped.items()) or "none") + "\n")
+    if not days:
+        return
+    rows = compare.compare(cfg, days, run_day)
+    out = ROOT / "compare.csv"
+    with out.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    print(f"\nSaved to {out}. Send Claude the table above (or this file).")
 
 
 def cmd_debug(cfg: dict) -> None:
@@ -454,11 +549,13 @@ def main(argv: list[str]) -> None:
         cmd_replay(cfg, date.fromisoformat(argv[2]))
     elif cmd == "backtest" and len(argv) > 3:
         cmd_backtest(cfg, date.fromisoformat(argv[2]), date.fromisoformat(argv[3]))
-    elif cmd == "backtest" and len(argv) > 2 and argv[2].endswith("months"):
+    elif cmd in ("backtest", "compare") and len(argv) > 2 and argv[2].endswith("months"):
         from datetime import timedelta
         months = int(argv[2].replace("months", ""))
         end = date.today() - timedelta(days=1)
-        cmd_backtest(cfg, end - timedelta(days=round(months * 30.4)), end)
+        (cmd_backtest if cmd == "backtest" else cmd_compare)(cfg, end - timedelta(days=round(months * 30.4)), end)
+    elif cmd == "compare" and len(argv) > 3:
+        cmd_compare(cfg, date.fromisoformat(argv[2]), date.fromisoformat(argv[3]))
     elif cmd == "debug":
         cmd_debug(cfg)
     elif cmd == "debug-expired" and len(argv) > 2:

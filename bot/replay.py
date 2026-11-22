@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 
 from .instruments import Contract, itm_strikes, pick, pick_strike
+from .orb import is_five_min_close, prime
 from .strategy import IST, Strategy, Trade, hhmm
 
 
@@ -28,6 +29,7 @@ def simulate_day(cfg: dict, day: date, index_candles: list[dict],
         log(f"No Nifty candles for {day} (holiday or no data).")
         return []
 
+    prime(index_candles)
     for bar in today:
         close_ts = bar["ts"] + 60
         now = datetime.fromtimestamp(close_ts, IST)
@@ -39,7 +41,7 @@ def simulate_day(cfg: dict, day: date, index_candles: list[dict],
             if this and strat.check_price(this["l"]):   # cautious: assume the option's low came first
                 strat.close(min(p.stop, this["o"]), now, "OPTION_STOP", exact=True)
             else:
-                why = strat.index_exit(bar)
+                why = strat.index_exit(bar, closed_upto(index_candles, close_ts) if is_five_min_close(now) else None, now)
                 if why:
                     last = closed_upto(held, close_ts)
                     strat.close(this["c"] if this else (last[-1]["c"] if last else p.entry_price), now, why)
@@ -50,6 +52,8 @@ def simulate_day(cfg: dict, day: date, index_candles: list[dict],
 
         if now.time() >= square_off:
             break
+        if not is_five_min_close(now):  # signals only come on finished 5-min candles
+            continue
         setup = strat.entry_signal(now, closed_upto(index_candles, close_ts))
         if not setup:
             continue
@@ -63,7 +67,7 @@ def simulate_day(cfg: dict, day: date, index_candles: list[dict],
         strat.open(c, bars[-1]["c"], now, setup)
 
     if strat.trades_today == 0:
-        log(f"{day}: no clean breakout after {cfg['timing']['no_entry_before']}. No trade.")
+        log(f"{day}: no clean signal after {cfg['timing']['no_entry_before']}. No trade.")
     return strat.closed
 
 
