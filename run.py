@@ -4,6 +4,7 @@
   python run.py paper                 run today's live paper trading (start before 09:15)
   python run.py replay 2026-11-19     replay a past day with the same rules
   python run.py backtest 2026-11-16 2026-11-20   replay every day in a date range, with a summary
+  python run.py debug                 print raw API answers to help fix data problems
   python run.py demo                  run on a made-up day, no API needed
 """
 from __future__ import annotations
@@ -138,6 +139,61 @@ def cmd_backtest(cfg: dict, first: date, last: date) -> None:
         print(f"Saved to {out}")
 
 
+def cmd_debug(cfg: dict) -> None:
+    """Print raw API answers (no token, no personal data) so Claude can match the real formats."""
+    import csv
+    import io
+    from bot.indstocks import IndstocksClient
+    from bot.strategy import IST
+    client = IndstocksClient.from_env(cfg["api"]["base_url"])
+    s = client.session
+
+    def show(label, path, params=None, n=700):
+        print(f"\n=== {label}: GET {path} {params or ''}")
+        try:
+            r = s.get(client.base_url + path, params=params, timeout=20)
+        except Exception as e:  # noqa: BLE001
+            print(f"request failed: {e.__class__.__name__}: {str(e)[:200]}")
+            return None
+        print(f"HTTP {r.status_code}, content-type {r.headers.get('content-type')}, {len(r.content)} bytes")
+        print(r.text[:n])
+        return r
+
+    for source in ("fno", "index"):
+        try:
+            r = s.get(client.base_url + "/market/instruments", params={"source": source}, timeout=60)
+        except Exception as e:  # noqa: BLE001
+            print(f"\n=== instruments source={source}: request failed: {e.__class__.__name__}: {str(e)[:200]}")
+            continue
+        print(f"\n=== instruments source={source}: HTTP {r.status_code}, "
+              f"content-type {r.headers.get('content-type')}, {len(r.content)} bytes")
+        text = r.text
+        lines = text.splitlines()
+        print("first 3 lines:")
+        for ln in lines[:3]:
+            print("  " + ln[:400])
+        hits = [ln for ln in lines if "NIFTY" in ln.upper()
+                and "BANK" not in ln.upper() and "FIN" not in ln.upper() and "MID" not in ln.upper()]
+        print(f"{len(hits)} lines mention NIFTY; first 5:")
+        for ln in hits[:5]:
+            print("  " + ln[:400])
+        if source == "fno" and lines:
+            rows = list(csv.DictReader(io.StringIO(text)))
+            if rows:
+                print("column names:", list(rows[0].keys()))
+
+    end = int(datetime.now(IST).timestamp() * 1000)
+    start = end - 4 * 86400 * 1000
+    for code in (cfg["api"]["index_scrip"], "NIDX_40000001", "IDX_40000001", "INDEX_40000001", "NSE_26000"):
+        show(f"LTP {code}", "/market/quotes/ltp", {"scrip-codes": code}, 300)
+    show("candles index", "/market/historical/1minute",
+         {"scrip-codes": cfg["api"]["index_scrip"], "start_time": start, "end_time": end}, 500)
+    show("candles RELIANCE (equity, as a control)", "/market/historical/1minute",
+         {"scrip-codes": "NSE_2885", "start_time": start, "end_time": end}, 500)
+    show("LTP RELIANCE (control)", "/market/quotes/ltp", {"scrip-codes": "NSE_2885"}, 300)
+    print("\nDone. Copy everything above and send it to Claude. It contains no token or account details.")
+
+
 def cmd_demo(cfg: dict) -> None:
     from tests.fake_market import make_day
     from bot.replay import simulate_day
@@ -160,6 +216,8 @@ def main(argv: list[str]) -> None:
         cmd_replay(cfg, date.fromisoformat(argv[2]))
     elif cmd == "backtest" and len(argv) > 3:
         cmd_backtest(cfg, date.fromisoformat(argv[2]), date.fromisoformat(argv[3]))
+    elif cmd == "debug":
+        cmd_debug(cfg)
     elif cmd == "demo":
         cmd_demo(cfg)
     else:
