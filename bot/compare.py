@@ -28,6 +28,8 @@ def variants(base: dict) -> list[tuple[str, dict]]:
                                              orb__target_r=0, orb__trail_start_r=1.0, orb__trail_r=1.0)),
         ("Trend, 3 trades/day", v(strategy__name="trend")),
         ("Trend, 1 trade/day", v(strategy__name="trend", trend__max_trades_per_day=1)),
+        ("Afternoon momentum alone", v(strategy__name="late")),
+        ("ORB + afternoon momentum", v(strategy__name="orb+late")),
     ]
     return out
 
@@ -39,6 +41,16 @@ def trend_grid(base: dict) -> list[tuple[str, dict]]:
         c["strategy"]["name"] = "trend"
         c["trend"].update(adx_min=adx, trail_r=trail, stop_atr=stop)
         out.append((f"Trend ADX>={adx} trail {trail}R stop {stop}xATR", c))
+    return out
+
+
+def late_grid(base: dict) -> list[tuple[str, dict]]:
+    out = []
+    for entry, morning, stop in itertools.product(("14:30", "14:45", "14:55"), (0.1, 0.2, 0.4), (20, 30, 50)):
+        c = copy.deepcopy(base)
+        c["strategy"]["name"] = "late"
+        c["late"].update(entry_time=entry, min_morning_pct=morning, stop_pts=stop)
+        out.append((f"Afternoon {entry} morning>={morning}% stop {stop}", c))
     return out
 
 
@@ -118,22 +130,23 @@ def compare(cfg: dict, days: list[tuple[date, dict]], run_day, log=print) -> lis
 
     report("=== The main versions, same days, same costs ===", variants(cfg))
 
-    # walk-forward on the trend grid: pick on the earlier half, judge on the later half
-    grid = trend_grid(cfg)
-    scored = []
-    for name, c in grid:
-        s1 = stats(run(c, first, run_day), cap)
-        scored.append((s1["net"], name, c, s1))
-    scored.sort(key=lambda x: -x[0])
-    log("=== Trend settings tried on the EARLIER half (best 5 of %d) ===" % len(grid))
-    log(HEAD)
-    for _, name, _, s1 in scored[:5]:
-        log(row(name, s1))
-    _, best_name, best_cfg, _ = scored[0]
-    s2 = stats(run(best_cfg, last, run_day), cap)
-    log("\n=== The honesty check: the earlier half's best trend settings, on the LATER half it never saw ===")
-    log(HEAD)
-    log(row(best_name, s2))
-    rows.append({"version": f"walk-forward pick: {best_name}", "period": "later",
-                 **{k: round(v, 1) for k, v in s2.items()}})
+    # walk-forward: pick settings on the earlier half, judge them on the later half
+    for label, grid in (("Trend", trend_grid(cfg)), ("Afternoon momentum", late_grid(cfg))):
+        scored = []
+        for name, c in grid:
+            s1 = stats(run(c, first, run_day), cap)
+            scored.append((s1["net"], name, c, s1))
+        scored.sort(key=lambda x: -x[0])
+        log(f"=== {label} settings tried on the EARLIER half (best 5 of {len(grid)}) ===")
+        log(HEAD)
+        for _, name, _, s1 in scored[:5]:
+            log(row(name, s1))
+        _, best_name, best_cfg, _ = scored[0]
+        s2 = stats(run(best_cfg, last, run_day), cap)
+        log(f"\n=== Honesty check: the earlier half's best {label.lower()} settings, on the LATER half it never saw ===")
+        log(HEAD)
+        log(row(best_name, s2))
+        log("")
+        rows.append({"version": f"walk-forward pick: {best_name}", "period": "later",
+                     **{k: round(v, 1) for k, v in s2.items()}})
     return rows

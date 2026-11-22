@@ -147,7 +147,7 @@ def find_setup(cfg: dict, index_closed: list[dict], now: datetime,
     reason = (f"Clear {'up' if sign > 0 else 'down'}trend (ADX {ind['adx'][i]:.0f}, 9-avg "
               f"{ind['fast'][i]:.0f} {'above' if sign > 0 else 'below'} 21-avg {ind['slow'][i]:.0f}) and {why}. "
               f"Nifty {close:.2f}, stop {stop:.0f}, trailing.")
-    return Setup("CE" if sign > 0 else "PE", close, round(stop, 2), round(target, 2), round(risk, 2), reason), None
+    return Setup("CE" if sign > 0 else "PE", close, round(stop, 2), round(target, 2), round(risk, 2), reason, "trend"), None
 
 
 def trend_over(cfg: dict, pos, index_closed: list[dict], now: datetime) -> bool:

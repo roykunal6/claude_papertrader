@@ -58,6 +58,8 @@ class StateFile:
         if s.get("day") != self.day:
             return
         strat.trades_today = s.get("trades_today", 0)
+        strat.part_trades = s.get("part_trades") or ({"orb": strat.trades_today} if strat.trades_today else {})
+        strat.blocked = s.get("blocked", False)
         self.locked = s.get("locked", {})
         if s.get("position"):
             p = s["position"]
@@ -74,6 +76,7 @@ class StateFile:
             pos["contract"]["expiry"] = strat.position.contract.expiry.isoformat()
             pos["entry_time"] = strat.position.entry_time.isoformat()
         self.path.write_text(json.dumps({"day": self.day, "trades_today": strat.trades_today,
+                                         "part_trades": strat.part_trades, "blocked": strat.blocked,
                                          "position": pos, "locked": self.locked}, indent=2))
 
 
@@ -161,7 +164,6 @@ def run_live(cfg: dict, live: bool = False) -> None:
     if strat.trades_today:
         log(f"Restarted: {strat.trades_today} trade(s) already taken today.")
     broker = LiveBroker(client, cfg, log) if live else None
-    max_trades = cfg["trade"]["max_trades_per_day"]
     if broker:
         # Never trust only the local file with real money: check the account too.
         held = broker.open_nifty_positions()
@@ -169,11 +171,11 @@ def run_live(cfg: dict, live: bool = False) -> None:
             alert.send("⚠️ Open Nifty position found",
                        f"Your account already holds {held[0].get('symbol')} (qty {held[0].get('net_qty')}) "
                        "that this bot doesn't know about. The bot will NOT trade today. Manage it in the app.")
-            strat.trades_today = max_trades
-        if strat.trades_today < max_trades and any(str(o.get("txn_type")).upper() == "BUY"
+            strat.blocked = True
+        if not strat.blocked and any(str(o.get("txn_type")).upper() == "BUY"
                                                     for o in broker.bot_orders_today()):
             log("The order book shows the bot already bought today. No more entries today.")
-            strat.trades_today = max_trades
+            strat.blocked = True
         funds = broker.option_buy_funds()
         log(f"Funds available for option buying: ₹{funds:,.0f}" if funds is not None else
             "Couldn't read funds; will check again before buying.")
@@ -215,10 +217,10 @@ def run_live(cfg: dict, live: bool = False) -> None:
     stop_file = ROOT / "STOP"
     alert.send("✅ Bot is running", f"{'LIVE trading (real money)' if live else 'Paper trading'} Nifty options today ({today}). "
                + (f"I'll watch Nifty from 9:15 to {cfg['orb']['range_end']}, then tell you exactly when to buy and sell."
-                if strat.name == "orb" else "I'll only trade if Nifty shows a clear trend, and tell you exactly when to buy and sell."))
+                if "orb" in strat.parts() else "I'll only trade if Nifty shows a clear trend, and tell you exactly when to buy and sell."))
 
     def buy_live(contract, ltp: float, now: datetime, setup) -> None:
-        strat.trades_today += 1  # the day's one signal is used, whatever happens next
+        strat.use_signal(setup.kind)  # the signal is used, whatever happens next
         limit = tick(ltp * (1 + broker.buffer))
         qty = strat.size(limit, contract.lot_size, setup.risk_pts)
         if qty == 0:
@@ -232,8 +234,7 @@ def run_live(cfg: dict, live: bool = False) -> None:
         if fill.qty <= 0:
             alert.send("⚠️ Buy did not go through", f"{contract.symbol}: {fill.note} Nothing was bought. No more trades today.")
             return
-        strat.trades_today -= 1  # open() counts the trade itself
-        strat.open(contract, fill.price, now, setup, filled_qty=fill.qty)
+        strat.open(contract, fill.price, now, setup, filled_qty=fill.qty, counted=True)
         if fill.note:
             log(fill.note)
         _buy_alert(alert, strat.position, live=True)
@@ -270,7 +271,7 @@ def run_live(cfg: dict, live: bool = False) -> None:
                     cache.refresh([idx], now)
                 index_c = closed_upto(cache.data.get(idx, []), close_ts)
                 today_c = [c for c in index_c if datetime.fromtimestamp(c["ts"], IST).date() == today]
-                if not range_told and strat.name == "orb" and now.time() >= range_end and today_c:
+                if not range_told and "orb" in strat.parts() and now.time() >= range_end and today_c:
                     range_told = True
                     from .orb import opening_range, range_problem
                     rng = opening_range(today_c, range_end)
@@ -302,7 +303,7 @@ def run_live(cfg: dict, live: bool = False) -> None:
                             contract = pick(contracts, expiry, k, setup.opt_type)
                             ltp = client.ltp([contract.scrip]).get(contract.scrip) if contract else None
                             if not ltp:
-                                strat.trades_today += 1
+                                strat.use_signal(setup.kind)
                                 log(f"Signal for {k:.0f} {setup.opt_type} but couldn't get its price. No trade today.")
                             elif not broker:
                                 if strat.open(contract, ltp, now, setup):

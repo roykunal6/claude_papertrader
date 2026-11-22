@@ -367,6 +367,49 @@ def test_compare_runs_every_version_and_the_walk_forward_check(tmp_path):
     logs = []
     rows = compare.compare(cfg(), days, R.run_day, log=logs.append)
     text = "\n".join(logs)
-    assert "ORB as tested" in text and "Trend, 3 trades/day" in text and "honesty check" in text
+    assert "ORB as tested" in text and "Trend, 3 trades/day" in text and "Honesty check" in text and "Afternoon momentum alone" in text
     orb_whole = next(r for r in rows if r["version"].startswith("ORB as tested") and r["period"] == "whole")
     assert orb_whole["trades"] >= 4
+
+
+# ---------------- afternoon momentum ----------------
+def late_cfg(name="late"):
+    c = cfg()
+    c["strategy"]["name"] = name
+    return c
+
+
+def test_afternoon_momentum_buys_call_when_morning_and_afternoon_are_up():
+    path = [25300.0 + 0.5 * i for i in range(375)]       # gapped up 0.4%, then rising all day
+    day, idx, opt, contracts, expiry = make_day(path=path)
+    logs = []
+    trades = simulate_day(late_cfg(), day, _with_previous_day(idx, 25200.0), opt, contracts, expiry, log=logs.append)
+    assert len(trades) == 1, logs
+    t = trades[0]
+    assert t.opt_type == "CE" and t.entry_time == "14:45:00" and t.exit_reason == "TIME_3:15"
+
+
+def test_afternoon_momentum_buys_put_when_both_down():
+    path = [25100.0 - 0.5 * i for i in range(375)]
+    day, idx, opt, contracts, expiry = make_day(path=path)
+    trades = simulate_day(late_cfg(), day, _with_previous_day(idx, 25200.0), opt, contracts, expiry, log=quiet())
+    assert len(trades) == 1 and trades[0].opt_type == "PE"
+
+
+def test_afternoon_momentum_skips_when_moves_disagree():
+    path = [25300.0 + 0.5 * i for i in range(300)] + [25450.0 - 1.0 * i for i in range(75)]  # up, then falling after 14:15
+    day, idx, opt, contracts, expiry = make_day(path=path)
+    logs = []
+    assert simulate_day(late_cfg(), day, _with_previous_day(idx, 25200.0), opt, contracts, expiry, log=logs.append) == []
+    assert any("Not a clear same-direction move" in m for m in logs)
+
+
+def test_orb_plus_afternoon_can_take_one_of_each():
+    # a clean morning breakout up (ORB), and a day that keeps rising into the afternoon
+    path = [25290.0 + 30 * math.sin(i / 2.5) for i in range(30)] + [25290.0 + 0.6 * i for i in range(345)]
+    day, idx, opt, contracts, expiry = make_day(path=path)
+    logs = []
+    trades = simulate_day(late_cfg("orb+late"), day, _with_previous_day(idx, 25200.0), opt, contracts, expiry,
+                          log=logs.append)
+    assert [t.entry_time >= "14:45:00" for t in trades] == [False, True], logs
+    assert all(t.opt_type == "CE" for t in trades)

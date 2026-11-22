@@ -61,7 +61,7 @@ def simulate_day(cfg: dict, day: date, index_candles: list[dict],
         c = pick(contracts, expiry, k, setup.opt_type)
         bars = closed_upto(option_candles.get(c.scrip, []), close_ts) if c else []
         if not bars or bars[-1]["ts"] < bar["ts"] - 300:
-            strat.trades_today += 1
+            strat.use_signal(setup.kind)
             log(f"{now:%H:%M} Signal for {k:.0f} {setup.opt_type} but no recent price for it in the data. Skipped.")
             continue
         strat.open(c, bars[-1]["c"], now, setup)

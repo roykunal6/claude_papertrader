@@ -125,6 +125,7 @@ class Setup:
     target: float        # Nifty level to book profit
     risk_pts: float      # distance from entry to stop
     reason: str
+    kind: str = "orb"    # which rule set found it ("orb", "trend", "late"); its exits use that config section
 
 
 def range_problem(rng: Range, o: dict) -> str | None:
@@ -186,7 +187,7 @@ def find_setup(cfg: dict, index_closed: list[dict], now: datetime,
     reason = (f"Nifty 5-min close {close:.2f} broke the opening range "
               f"{'high ' + format(rng.high, '.2f') if sign > 0 else 'low ' + format(rng.low, '.2f')}"
               f" (range {rng.low:.0f}-{rng.high:.0f}). Nifty stop {stop:.0f}, target {target:.0f}.")
-    return Setup(opt, close, round(stop, 2), round(target, 2), round(risk, 2), reason), None
+    return Setup(opt, close, round(stop, 2), round(target, 2), round(risk, 2), reason, "orb"), None
 
 
 def spot_exit(cfg: dict, pos, bar: dict, section: str = "orb") -> str | None:

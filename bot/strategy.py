@@ -15,7 +15,7 @@ from datetime import datetime
 
 from .costs import order_charges
 from .instruments import Contract
-from . import orb, trend
+from . import late, orb, trend
 from .orb import IST, Setup, hhmm, spot_exit
 
 __all__ = ["IST", "Position", "Strategy", "Trade", "hhmm"]
@@ -44,6 +44,7 @@ class Position:
     risk_pts: float = 0.0
     spot_stop_moved: bool = False
     spot_best: float = 0.0      # best Nifty level since entry (for the trailing stop)
+    kind: str = "orb"           # which rule set opened it
 
 
 @dataclass
@@ -73,6 +74,8 @@ class Strategy:
     closed: list[Trade] = field(default_factory=list)
     _notes: set = field(default_factory=set)
     _seen_bars: set = field(default_factory=set)
+    part_trades: dict = field(default_factory=dict)   # signals used today, per rule set
+    blocked: bool = False       # live safety checks said: no new trades today
 
     def _t(self, key: str):
         return hhmm(self.cfg["timing"][key])
@@ -118,25 +121,46 @@ class Strategy:
     def day_pnl(self) -> float:
         return sum(t.net_pnl for t in self.closed)
 
+    def parts(self) -> list[str]:
+        """Rule sets in use: "orb", "trend", "late", or a combination such as "orb+late"."""
+        return [x.strip() for x in self.name.split("+") if x.strip()]
+
+    def _part_open(self, part: str, t) -> bool:
+        tr = self.cfg["trade"]
+        used = self.part_trades.get(part, 0)
+        if part == "late":
+            return used < 1 and late.in_window(self.cfg, t)
+        limit = self.cfg.get(part, {}).get("max_trades_per_day", tr["max_trades_per_day"])
+        return used < limit and self._t("no_entry_before") <= t <= self._t("last_entry")
+
+    def use_signal(self, kind: str) -> None:
+        self.trades_today += 1
+        self.part_trades[kind] = self.part_trades.get(kind, 0) + 1
+
     def can_enter(self, now: datetime) -> bool:
         t = now.astimezone(IST).time()
         tr = self.cfg["trade"]
         losses = sum(1 for x in self.closed if x.net_pnl <= 0)
-        return (self.position is None
-                and self.trades_today < self.cfg.get(self.name, {}).get("max_trades_per_day", tr["max_trades_per_day"])
+        return (self.position is None and not self.blocked
                 and losses < tr.get("max_losing_trades_per_day", 99)
                 and self.day_pnl() > -tr.get("max_daily_loss", 10**9)
-                and self._t("no_entry_before") <= t <= self._t("last_entry"))
+                and any(self._part_open(p, t) for p in self.parts()))
 
     def entry_signal(self, now: datetime, index_closed: list[dict]) -> Setup | None:
-        """Called once per finished 1-min candle with Nifty's finished 1-min candles."""
+        """Called once per finished 5-min candle with Nifty's finished 1-min candles."""
         if not self.can_enter(now):
             return None
-        mod = trend if self.name == "trend" else orb
-        setup, note = mod.find_setup(self.cfg, index_closed, now, self._seen_bars)
-        if note:
-            self.note(note)
-        return setup
+        t = now.astimezone(IST).time()
+        mods = {"orb": orb, "trend": trend, "late": late}
+        for part in self.parts():
+            if not self._part_open(part, t):
+                continue
+            setup, note = mods[part].find_setup(self.cfg, index_closed, now, self._seen_bars if part != "late" else None)
+            if note:
+                self.note(note)
+            if setup:
+                return setup
+        return None
 
     def index_exit(self, bar: dict, index_closed: list[dict] | None = None,
                    now: datetime | None = None) -> str | None:
@@ -145,21 +169,22 @@ class Strategy:
         if not p:
             return None
         before = p.spot_stop
-        why = spot_exit(self.cfg, p, bar, self.name)
+        why = spot_exit(self.cfg, p, bar, p.kind)
         if not why and p.spot_stop != before:
             self.log(f"Nifty stop moved {before:.0f} -> {p.spot_stop:.0f} (best so far {p.spot_best:.0f}).")
-        if not why and self.name == "trend" and index_closed and now and trend.trend_over(self.cfg, p, index_closed, now):
+        if not why and p.kind == "trend" and index_closed and now and trend.trend_over(self.cfg, p, index_closed, now):
             why = "TREND_END"
         return why
 
     # ---------------- fills ----------------
     def open(self, contract: Contract, market_price: float, now: datetime, setup: Setup,
-             filled_qty: int | None = None) -> Position | None:
+             filled_qty: int | None = None, counted: bool = False) -> Position | None:
         """Paper: fill at last price plus slippage. Live: pass the real fill price and filled_qty."""
         live = filled_qty is not None
         price = market_price if live else self.slip(market_price, "BUY")
         qty = filled_qty if live else self.size(price, contract.lot_size, setup.risk_pts)
-        self.trades_today += 1  # the day's one signal is used up, whatever happens; don't chase
+        if not counted:
+            self.use_signal(setup.kind)  # the signal is used up, whatever happens; don't chase
         if qty == 0:
             self.log(f"{now:%H:%M} Signal on {contract.symbol} but even 1 lot at ₹{price} (x{contract.lot_size}) "
                      f"is over ₹{self.cfg['capital']['max_invested']:,} or risks more than "
@@ -173,7 +198,7 @@ class Strategy:
             target=tick(price + abs(setup.target - setup.spot) * delta) if setup.target else 0.0, stop=stop,
             entry_charges=order_charges(price * qty, "BUY", self.cfg["charges"]), reason=setup.reason,
             peak=price, initial_stop=stop, spot_entry=setup.spot, spot_stop=setup.stop,
-            spot_target=setup.target, risk_pts=setup.risk_pts, spot_best=setup.spot)
+            spot_target=setup.target, risk_pts=setup.risk_pts, spot_best=setup.spot, kind=setup.kind)
         p = self.position
         self.log(f"{now:%H:%M:%S} {'LIVE' if live else 'PAPER'} BUY {qty} x {contract.symbol} @ ₹{price} "
                  f"(₹{price * qty:,.0f}). Exit if Nifty closes {'below' if contract.opt_type == 'CE' else 'above'} "
