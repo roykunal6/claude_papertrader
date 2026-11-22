@@ -5,7 +5,8 @@
   python run.py live                  REAL MONEY: same rules, places real orders (needs [live] enabled = true)
   python run.py live-check            read-only: your public IP, funds and open positions, before going live
   python run.py replay 2026-11-19     replay a past day with the same rules
-  python run.py backtest 2026-11-16 2026-11-20   replay every day in a date range, with a summary
+  python run.py backtest 2026-11-09 2026-11-20   replay every day in a date range, with a summary
+                                      (expired weekly contracts are fetched too)
   python run.py export 2026-11-20     save that day's Nifty 1-min candles to a CSV
   python run.py export 2026-11-20 25400 PE   same, for one option
   python run.py test-alert            send a test alert (Mac pop-up, voice, Telegram)
@@ -73,8 +74,28 @@ def cmd_check(cfg: dict) -> None:
     print("All good." if n and contracts else "Something is missing above; send this to Claude.")
 
 
+_EXPIRED: dict = {}  # cache for one run: expiry list and chains of expired weeklies
+
+
+def _expired_chain(cfg: dict, client, day: date):
+    """(expiry, contracts) for the weekly that was current on `day`, if it has expired since."""
+    from datetime import timedelta
+    from bot.indstocks import expired_contracts, expired_expiries
+    und = cfg["trade"]["underlying"]
+    if "expiries" not in _EXPIRED:
+        today = date.today()
+        _EXPIRED["expiries"] = expired_expiries(client, und, today - timedelta(days=364), today)
+    exp = next((e for e in _EXPIRED["expiries"] if e >= day), None)
+    if exp is None or (exp - day).days > 10:
+        return None, []
+    if exp not in _EXPIRED:
+        _EXPIRED[exp] = expired_contracts(client, und, exp)
+    return exp, _EXPIRED[exp]
+
+
 def replay_day(cfg: dict, client, contracts, day: date, log=print):
-    """Replay one past day. Returns (trades, note)."""
+    """Replay one past day. Returns (trades, note). Works for expired weeklies too."""
+    from bot.indstocks import expired_candles
     from bot.instruments import nearest_expiry, pick
     from bot.replay import day_window_ms, simulate_day, strikes_needed
     from bot.strategy import IST
@@ -86,19 +107,25 @@ def replay_day(cfg: dict, client, contracts, day: date, log=print):
     today_c = [c for c in index_c if datetime.fromtimestamp(c["ts"], IST).date() == day]
     if not today_c:
         return [], "no market data (holiday?)"
-    # The contract the bot would have traded is the nearest expiry on or after that day.
-    # Only contracts that haven't expired yet are in the instrument list.
-    expiry = nearest_expiry(contracts, day)
-    if expiry is None:
-        return [], "no contracts"
-    if (expiry - day).days >= 7:  # weeklies are ~7 days apart, so an older (expired) weekly was nearest
-        return [], "skipped: that day's weekly contract has expired (no data for it yet)"
+    # The contract the bot would have traded is the nearest weekly expiry on or after that day.
+    expiry, chain, expired = nearest_expiry(contracts, day), contracts, False
+    if expiry is None or (expiry - day).days >= 7:  # that day's weekly has expired: use the expired-contracts API
+        try:
+            old_exp, old_chain = _expired_chain(cfg, client, day)
+        except Exception as e:  # noqa: BLE001
+            return [], f"couldn't load that day's expired contract ({e.__class__.__name__}: {str(e)[:150]})"
+        if not old_chain:
+            return [], "skipped: couldn't find that day's expired weekly contract"
+        expiry, chain, expired = old_exp, old_chain, True
     if cfg["trade"]["skip_expiry_day"] and day == expiry:
         return [], "expiry day, no trading"
     needed = [c for k in strikes_needed(today_c, cfg["trade"]["strike_step"])
-              for t in ("CE", "PE") if (c := pick(contracts, expiry, k, t))]
-    opt_c = client.candles([c.scrip for c in needed], start, end)
-    trades = simulate_day(cfg, day, index_c, opt_c, contracts, expiry, log=log)
+              for t in ("CE", "PE") if (c := pick(chain, expiry, k, t))]
+    scrips = [c.scrip for c in needed]
+    opt_c = expired_candles(client, scrips, start, end) if expired else client.candles(scrips, start, end)
+    if not any(opt_c.values()):
+        return [], "skipped: no option candles came back for that day"
+    trades = simulate_day(cfg, day, index_c, opt_c, chain, expiry, log=log)
     return trades, "traded" if trades else "no clear signal"
 
 
@@ -143,6 +170,11 @@ def cmd_backtest(cfg: dict, first: date, last: date) -> None:
     wins = sum(1 for r in rows if r["net_pnl"] > 0)
     print(f"Trades: {len(rows)}  Wins: {wins}  Losses: {len(rows) - wins}  "
           f"Net P&L: ₹{total:,.2f} on ₹{cfg['capital']['max_invested']:,} deployed")
+    if rows:
+        best = max(rows, key=lambda r: r["net_pnl"])
+        worst = min(rows, key=lambda r: r["net_pnl"])
+        print(f"Best day: {best['date']} ₹{best['net_pnl']:,.0f}   Worst day: {worst['date']} ₹{worst['net_pnl']:,.0f}   "
+              f"Return on ₹{cfg['capital']['total']:,} capital: {100 * total / cfg['capital']['total']:.1f}%")
     if rows:
         out = ROOT / "backtest.csv"
         with out.open("w", newline="", encoding="utf-8") as f:
@@ -204,6 +236,11 @@ def cmd_debug(cfg: dict) -> None:
     show("candles RELIANCE (equity, as a control)", "/market/historical/1minute",
          {"scrip-codes": "NSE_2885", "start_time": start, "end_time": end}, 500)
     show("LTP RELIANCE (control)", "/market/quotes/ltp", {"scrip-codes": "NSE_2885"}, 300)
+    from datetime import timedelta
+    d0 = datetime.now(IST).date()
+    show("expired expiries", "/market/instruments/expired/expiries",
+         {"underlying": "NIFTY", "segment": "DERIVATIVE",
+          "expiry_from": (d0 - timedelta(days=30)).isoformat(), "expiry_to": d0.isoformat()}, 500)
     print("\nDone. Copy everything above and send it to Claude. It contains no token or account details.")
 
 

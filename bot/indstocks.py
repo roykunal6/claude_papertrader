@@ -132,6 +132,69 @@ class IndstocksClient:
         return out
 
 
+def _rows(body) -> list:
+    """Pull the list out of {"status": "success", "data": [...]} or similar shapes."""
+    data = body.get("data", body) if isinstance(body, dict) else body
+    if isinstance(data, dict):
+        for k in ("expiries", "contracts", "items", "results", "data"):
+            if isinstance(data.get(k), list):
+                return data[k]
+    return data if isinstance(data, list) else []
+
+
+def expired_expiries(client: "IndstocksClient", underlying: str, start, end) -> list:
+    """Past expiry dates (as date objects) between start and end (dates, span <= 1 year)."""
+    from .instruments import parse_date
+    body = client._get("/market/instruments/expired/expiries", {
+        "underlying": underlying, "segment": "DERIVATIVE",
+        "expiry_from": start.isoformat(), "expiry_to": end.isoformat()})
+    out = []
+    for v in _rows(body):
+        v = v.get("expiry") if isinstance(v, dict) else v
+        try:
+            out.append(parse_date(str(v)[:10]))
+        except ValueError:
+            pass
+    return sorted(set(out))
+
+
+def expired_contracts(client: "IndstocksClient", underlying: str, expiry) -> list:
+    """The full option chain of an expired expiry, as Contract objects.
+    scrip is "EXP:<trading_symbol>" so it can't be mixed up with a live code."""
+    from .instruments import Contract
+    body = client._get("/market/instruments/expired/contracts", {
+        "underlying": underlying, "segment": "DERIVATIVE", "expiry": expiry.isoformat()})
+    out = []
+    for r in _rows(body):
+        try:
+            if str(r.get("instrument_type", "OPTIDX")).upper() != "OPTIDX":
+                continue
+            sym = r["trading_symbol"]
+            out.append(Contract(scrip=f"EXP:{sym}", symbol=sym, strike=float(r["strike_price"]),
+                                opt_type=str(r["option_type"]).upper(), expiry=expiry,
+                                lot_size=int(float(r.get("lot_size") or 65))))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def expired_candles(client: "IndstocksClient", scrips: list, start_ms: int, end_ms: int,
+                    interval: str = "1minute") -> dict:
+    """Candles for expired contracts, keyed by the same "EXP:<symbol>" codes."""
+    out = {}
+    syms = [s.split(":", 1)[1] for s in scrips]
+    for i in range(0, len(syms), 50):
+        body = client._get(f"/market/historical/expired/{interval}", {
+            "trading-symbols": ",".join(syms[i:i + 50]), "start_time": start_ms, "end_time": end_ms,
+            "segment": "NFO"})
+        for sym, v in (body.get("data") or {}).items():
+            rows = (v or {}).get("candles") or [] if isinstance(v, dict) else v or []
+            out[f"EXP:{sym}"] = [{"ts": int(c["ts"]), "o": float(c["o"]), "h": float(c["h"]),
+                                  "l": float(c["l"]), "c": float(c["c"]), "v": float(c.get("v") or 0)}
+                                 for c in rows]
+    return out
+
+
 def detect_option_prefix(client: "IndstocksClient", security_ids: list[str], log=print) -> str:
     """Work out whether option codes are NSE_<id> or NFO_<id>.
 

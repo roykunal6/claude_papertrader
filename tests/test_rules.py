@@ -240,3 +240,36 @@ def test_paper_command_never_creates_a_broker():
     from bot import live
     src = inspect.getsource(live.run_live)
     assert "LiveBroker(client, cfg, log) if live else None" in src
+
+
+# ---------------- backtest on an expired weekly ----------------
+def test_backtest_uses_expired_contract_api_for_old_weeks():
+    import run as R
+    day, idx, opt, contracts, expiry = make_day(seed=7)   # 2026-11-19, weekly expiring later
+    old = {c.scrip: c for c in contracts}
+    sym = {c.scrip: f"NIFTY{c.strike:.0f}{c.opt_type}" for c in contracts}
+
+    class Client:
+        calls = []
+        def candles(self, scrips, a, b, interval="1minute"):
+            return {s: idx for s in scrips if s.endswith("40000001")}
+        def _get(self, path, params=None, expect_json=True):
+            self.calls.append(path)
+            if path.endswith("expired/expiries"):
+                return {"status": "success", "data": [expiry.isoformat()]}
+            if path.endswith("expired/contracts"):
+                return {"status": "success", "data": [
+                    {"trading_symbol": sym[s], "instrument_type": "OPTIDX", "strike_price": c.strike,
+                     "option_type": c.opt_type, "lot_size": 65, "expiry": expiry.isoformat()}
+                    for s, c in old.items()]}
+            if "/historical/expired/" in path:
+                want = params["trading-symbols"].split(",")
+                return {"success": True, "data": {sym[s]: {"candles": opt[s]} for s in old if sym[s] in want}}
+            raise AssertionError(path)
+
+    R._EXPIRED.clear()
+    c = cfg()
+    c["trade"]["underlying"] = "NIFTY"
+    trades, note = R.replay_day(c, Client(), [], day, log=lambda m: None)   # no live contracts at all
+    assert note == "traded" and len(trades) == 1
+    assert any("historical/expired" in p for p in Client.calls)
