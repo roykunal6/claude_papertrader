@@ -2,6 +2,8 @@
 
   python run.py check                 test your API token and data access
   python run.py paper                 run today's live paper trading (start before 09:15)
+  python run.py live                  REAL MONEY: same rules, places real orders (needs [live] enabled = true)
+  python run.py live-check            read-only: your public IP, funds and open positions, before going live
   python run.py replay 2026-11-19     replay a past day with the same rules
   python run.py backtest 2026-11-16 2026-11-20   replay every day in a date range, with a summary
   python run.py export 2026-11-20     save that day's Nifty 1-min candles to a CSV
@@ -234,6 +236,61 @@ def cmd_export(cfg: dict, day: date, option: list | None = None) -> None:
     print(f"Saved {len(rows)} candles (that day plus 4 days before, for warm-up) to {out}")
 
 
+LIVE_PHRASE = "REAL MONEY"
+
+
+def cmd_live(cfg: dict) -> None:
+    if not cfg.get("live", {}).get("enabled", False):
+        print("Live trading is OFF. To turn it on, set  enabled = true  under [live] in config.toml.\n"
+              "Until then, use:  python run.py paper")
+        return
+    print("=" * 70)
+    print("  LIVE MODE: this bot will place REAL orders in your INDmoney account.")
+    print(f"  Up to ₹{cfg['capital']['max_invested']:,} on one Nifty option trade today.")
+    print("  To stop at any time: create a file named STOP in this folder (it sells and exits),")
+    print("  or press Ctrl+C and manage the position yourself in the INDmoney app.")
+    print("=" * 70)
+    typed = input(f'Type  {LIVE_PHRASE}  to start live trading (anything else = cancel): ').strip()
+    if typed != LIVE_PHRASE:
+        print("Cancelled. Nothing was done.")
+        return
+    from bot.live import run_live
+    run_live(cfg, live=True)
+
+
+def cmd_live_check(cfg: dict) -> None:
+    """Read-only. Nothing is bought or sold."""
+    import requests
+    from bot.broker import LiveBroker
+    from bot.indstocks import IndstocksClient
+    try:
+        ip = requests.get("https://api.ipify.org", timeout=10).text.strip()
+    except Exception as e:  # noqa: BLE001
+        ip = f"(couldn't check: {e.__class__.__name__})"
+    print(f"1. Your public IP right now: {ip}")
+    print("   INDstocks only accepts orders from the IP you registered under API Trading > Access tokens.")
+    client = IndstocksClient.from_env(cfg["api"]["base_url"])
+    client.profile()
+    print("2. Token works.")
+    b = LiveBroker(client, cfg)
+    try:
+        f = b.option_buy_funds()
+        print(f"3. Funds for option buying: ₹{f:,.0f}" if f is not None else "3. Funds: couldn't read option_buy balance.")
+    except Exception as e:  # noqa: BLE001
+        print(f"3. Funds check failed: {e}")
+    try:
+        held = b.open_nifty_positions()
+        print(f"4. Open Nifty positions: {len(held)}" + "".join(
+            f"\n   {p.get('symbol')} qty {p.get('net_qty')} avg ₹{p.get('avg_price')}" for p in held))
+    except Exception as e:  # noqa: BLE001
+        print(f"4. Positions check failed: {e}")
+    try:
+        print(f"5. Orders placed by this bot today: {len(b.bot_orders_today())}")
+    except Exception as e:  # noqa: BLE001
+        print(f"5. Order book check failed: {e}")
+    print("Live trading is", "ON" if cfg.get("live", {}).get("enabled") else "OFF", "in config.toml.")
+
+
 def cmd_test_alert(cfg: dict) -> None:
     from bot.alerts import Alerter
     a = Alerter(cfg)
@@ -271,6 +328,13 @@ def main(argv: list[str]) -> None:
         cmd_debug(cfg)
     elif cmd == "export" and len(argv) > 2:
         cmd_export(cfg, date.fromisoformat(argv[2]), argv[3:5] if len(argv) > 4 else None)
+    elif cmd == "live":
+        cmd_live(cfg)
+    elif cmd == "live-check":
+        try:
+            cmd_live_check(cfg)
+        except Exception as e:  # noqa: BLE001
+            print(f"\nCheck stopped: {e.__class__.__name__}: {e}\nSend this to Claude.")
     elif cmd in ("test-alert", "alert"):
         cmd_test_alert(cfg)
     elif cmd == "demo":

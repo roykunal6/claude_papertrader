@@ -39,6 +39,7 @@ class Position:
     stop: float
     entry_charges: float
     reason: str
+    pending_exit: str | None = None  # live mode: an exit that hasn't fully filled yet
     peak: float = 0.0           # highest price since entry (for the trailing stop)
     initial_stop: float = 0.0
 
@@ -78,9 +79,12 @@ class Strategy:
         return trend_line([c["c"] for c in candles], ind["length"], ind["method"])
 
     def size(self, price: float, lot_size: int) -> int:
-        """Quantity (in units) that fits inside max_invested including buy charges."""
+        """Quantity (in units) that fits inside max_invested including buy charges,
+        and below the exchange's per-order freeze limit."""
         budget = self.cfg["capital"]["max_invested"]
         lots = math.floor(budget / (price * lot_size))
+        max_qty = self.cfg.get("live", {}).get("max_qty_per_order", 1755)
+        lots = min(lots, max_qty // lot_size)
         while lots > 0:
             qty = lots * lot_size
             cost = price * qty + order_charges(price * qty, "BUY", self.cfg["charges"])
@@ -143,9 +147,12 @@ class Strategy:
         return last.colour == RED and candles[-1]["c"] < last.line
 
     # ---------------- paper fills ----------------
-    def open(self, contract: Contract, market_price: float, now: datetime, reason: str) -> Position | None:
-        price = self.slip(market_price, "BUY")
-        qty = self.size(price, contract.lot_size)
+    def open(self, contract: Contract, market_price: float, now: datetime, reason: str,
+             filled_qty: int | None = None) -> Position | None:
+        """Paper: fill at last price plus slippage. Live: pass the real fill price and filled_qty."""
+        live = filled_qty is not None
+        price = market_price if live else self.slip(market_price, "BUY")
+        qty = filled_qty if live else self.size(price, contract.lot_size)
         if qty == 0:
             self.log(f"{now:%H:%M} Signal on {contract.symbol} but 1 lot at ₹{price} "
                      f"(x{contract.lot_size}) is more than ₹{self.cfg['capital']['max_invested']}. No trade.")
@@ -162,7 +169,7 @@ class Strategy:
         self.position.initial_stop = self.position.stop
         self.trades_today += 1
         p = self.position
-        self.log(f"{now:%H:%M:%S} PAPER BUY {qty} x {contract.symbol} @ ₹{price} "
+        self.log(f"{now:%H:%M:%S} {'LIVE' if live else 'PAPER'} BUY {qty} x {contract.symbol} @ ₹{price} "
                  f"(₹{price * qty:,.0f}). Target ₹{p.target}, stop ₹{p.stop}. Why: {reason}")
         return p
 
@@ -206,7 +213,8 @@ class Strategy:
             return "TRAIL_STOP" if p.stop > p.initial_stop else "STOP_LOSS"
         return None
 
-    def close(self, market_price: float, now: datetime, reason: str, exact: bool = False) -> Trade:
+    def close(self, market_price: float, now: datetime, reason: str, exact: bool = False,
+              live: bool = False) -> Trade:
         p = self.position
         assert p is not None
         price = market_price if exact else self.slip(market_price, "SELL")
@@ -222,6 +230,6 @@ class Strategy:
             entry_reason=p.reason)
         self.closed.append(trade)
         self.position = None
-        self.log(f"{now:%H:%M:%S} PAPER SELL {trade.qty} x {trade.symbol} @ ₹{price} ({reason}). "
+        self.log(f"{now:%H:%M:%S} {'LIVE' if live else 'PAPER'} SELL {trade.qty} x {trade.symbol} @ ₹{price} ({reason}). "
                  f"P&L ₹{trade.gross_pnl:,.2f} gross, ₹{trade.net_pnl:,.2f} after ₹{trade.charges:,.2f} charges")
         return trade

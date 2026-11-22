@@ -1,4 +1,4 @@
-"""Run the strategy on today's live market, on paper. Reads prices only; never places orders."""
+"""Run the strategy on today's live market. Paper by default; real orders only via `run.py live`."""
 from __future__ import annotations
 
 import csv
@@ -9,8 +9,9 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from .indstocks import ApiError, IndstocksClient
-from .instruments import Contract, itm_strikes, nearest_expiry, pick
+from .instruments import Contract, nearest_expiry, pick, strikes_for
 from .alerts import Alerter, contract_label
+from .broker import LiveBroker, tick
 from .market import load_contracts
 from .replay import closed_upto
 from .strategy import IST, Position, Strategy, Trade, hhmm
@@ -97,28 +98,35 @@ class CandleCache:
                 self.data[s] = [merged[k] for k in sorted(merged)]
 
 
-def _buy_alert(alert: Alerter, p) -> None:
+def _buy_alert(alert: Alerter, p, live: bool = False) -> None:
     lots = p.qty // p.contract.lot_size
-    alert.send("🟢 BUY NOW",
+    alert.send("🟢 BOUGHT (real order)" if live else "🟢 BUY NOW",
                f"{contract_label(p.contract)}: {lots} lot(s), qty {p.qty}, around ₹{p.entry_price}. "
                f"Stop ₹{p.stop}. Target ₹{p.target}.",
-               speak=f"Buy now. Nifty {p.contract.strike:.0f} {'call' if p.contract.opt_type == 'CE' else 'put'}.")
+               speak=("Bought. " if live else "Buy now. ") + f"Nifty {p.contract.strike:.0f} {'call' if p.contract.opt_type == 'CE' else 'put'}.")
 
 
-def _sell_alert(alert: Alerter, trade) -> None:
+def _sell_alert(alert: Alerter, trade, live: bool = False) -> None:
     why = {"TARGET": "target hit", "STOP_LOSS": "stop loss hit", "TRAIL_STOP": "trailing stop hit",
            "RED_LINE": "line turned red", "TIME_3:15": "3:15 PM square-off"}.get(trade.exit_reason, trade.exit_reason)
+    if live:
+        alert.send("🔴 SOLD (real order)",
+                   f"Sold all {trade.qty} qty {trade.symbol} ({why}) at ₹{trade.exit_price}. "
+                   f"P&L about ₹{trade.net_pnl:,.0f} after charges. Done for today.", speak="Sold.")
+        return
     alert.send("🔴 SELL NOW",
                f"Sell ALL {trade.qty} qty {trade.symbol} ({why}), around ₹{trade.exit_price}. "
                f"P&L ₹{trade.net_pnl:,.0f} after charges. Done for today.",
                speak="Sell now.")
 
 
-def run_live(cfg: dict) -> None:
+def run_live(cfg: dict, live: bool = False) -> None:
     today = datetime.now(IST).date()
     log = Journal(today)
     log("=" * 70)
-    log(f"Nifty options PAPER bot starting for {today}. No real orders are ever placed.")
+    mode = "live" if live else "paper"
+    log(f"Nifty options bot starting for {today} in {'LIVE (REAL MONEY)' if live else 'PAPER'} mode."
+        + ("" if live else " No real orders are placed."))
     client = IndstocksClient.from_env(cfg["api"]["base_url"])
     client.profile()
     log("API token OK.")
@@ -142,15 +150,81 @@ def run_live(cfg: dict) -> None:
     state.load(strat)
     if strat.trades_today:
         log(f"Restarted: {strat.trades_today} trade(s) already taken today.")
+    broker = LiveBroker(client, cfg, log) if live else None
+    max_trades = cfg["trade"]["max_trades_per_day"]
+    if broker:
+        # Never trust only the local file with real money: check the account too.
+        held = broker.open_nifty_positions()
+        if held and not strat.position:
+            alert.send("⚠️ Open Nifty position found",
+                       f"Your account already holds {held[0].get('symbol')} (qty {held[0].get('net_qty')}) "
+                       "that this bot doesn't know about. The bot will NOT trade today. Manage it in the app.")
+            strat.trades_today = max_trades
+        if strat.trades_today < max_trades and any(str(o.get("txn_type")).upper() == "BUY"
+                                                    for o in broker.bot_orders_today()):
+            log("The order book shows the bot already bought today. No more entries today.")
+            strat.trades_today = max_trades
+        funds = broker.option_buy_funds()
+        log(f"Funds available for option buying: ₹{funds:,.0f}" if funds is not None else
+            "Couldn't read funds; will check again before buying.")
+    last_nag = 0.0
+
+    def do_exit(ltp: float, now: datetime, reason: str) -> None:
+        """Close the position: paper fill, or a real sell order in live mode."""
+        nonlocal last_nag
+        p = strat.position
+        if not broker:
+            t = strat.close(ltp, now, reason)
+            append_trade(t, mode)
+            _sell_alert(alert, t)
+            state.save(strat)
+            return
+        fill = broker.sell(p.contract, p.qty, ltp, get_ltp=lambda: client.ltp([p.contract.scrip]).get(p.contract.scrip))
+        if fill.qty >= p.qty:
+            t = strat.close(fill.price, now, reason, exact=True, live=True)
+            append_trade(t, mode)
+            _sell_alert(alert, t, live=True)
+        else:
+            p.qty -= fill.qty
+            p.pending_exit = reason  # keep trying every second
+            if _time.time() - last_nag > 30:
+                last_nag = _time.time()
+                alert.send("🚨 SELL BY HAND NOW",
+                           f"The bot could not sell all of {p.contract.symbol}. {p.qty} qty still open. "
+                           f"Open the INDmoney app and sell it. ({fill.note})", speak="Warning. Sell by hand now.")
+        state.save(strat)
 
     cache = CandleCache(client)
     idx = cfg["api"]["index_scrip"]
     step = cfg["trade"]["strike_step"]
     square_off = hhmm(cfg["timing"]["square_off"])
     last_minute_done = None
-    lock = cfg["trade"].get("strike_mode", "follow") == "lock"
-    alert.send("✅ Bot is running", f"Paper trading Nifty options today ({today}). "
+    strike_mode = cfg["trade"].get("strike_mode", "follow")
+    lock = strike_mode in ("lock", "single")
+    stop_file = ROOT / "STOP"
+    alert.send("✅ Bot is running", f"{'LIVE trading (real money)' if live else 'Paper trading'} Nifty options today ({today}). "
                f"I'll pick today's strike at {cfg['timing']['no_entry_before']} and tell you exactly when to buy and sell.")
+
+    def buy_live(contract, ltp: float, now: datetime, reason: str) -> None:
+        strat.trades_today += 1  # the day's one signal is used, whatever happens next
+        limit = tick(ltp * (1 + broker.buffer))
+        qty = strat.size(limit, contract.lot_size)
+        if qty == 0:
+            log(f"1 lot of {contract.symbol} at ₹{limit} is more than ₹{cfg['capital']['max_invested']}. No trade.")
+            return
+        funds = broker.option_buy_funds()
+        if funds is not None and funds < limit * qty + 50:
+            alert.send("⚠️ Not enough funds", f"Needed about ₹{limit * qty:,.0f}, account has ₹{funds:,.0f}. No trade today.")
+            return
+        fill = broker.buy(contract, qty, ltp)
+        if fill.qty <= 0:
+            alert.send("⚠️ Buy did not go through", f"{contract.symbol}: {fill.note} Nothing was bought. No more trades today.")
+            return
+        strat.trades_today -= 1  # open() counts the trade itself
+        strat.open(contract, fill.price, now, reason, filled_qty=fill.qty)
+        if fill.note:
+            log(fill.note)
+        _buy_alert(alert, strat.position, live=True)
 
     while True:
         now = datetime.now(IST)
@@ -158,27 +232,27 @@ def run_live(cfg: dict) -> None:
             break
         try:
             # ---- every second: watch target/stop on the open position ----
+            if stop_file.exists():
+                log("STOP file found: closing any position and stopping.")
+                if strat.position:
+                    p = strat.position
+                    do_exit(client.ltp([p.contract.scrip]).get(p.contract.scrip) or p.entry_price, now, "MANUAL_STOP")
+                if not strat.position:
+                    break
             if strat.position:
                 p = strat.position
                 ltp = client.ltp([p.contract.scrip]).get(p.contract.scrip)
                 if ltp is not None:
-                    reason = strat.check_price(ltp)
+                    reason = getattr(p, "pending_exit", None) or strat.check_price(ltp)
                     if reason:
-                        t = strat.close(ltp, now, reason)
-                        append_trade(t, "paper")
-                        _sell_alert(alert, t)
-                        state.save(strat)
+                        do_exit(ltp, now, reason)
                     else:
                         moved = strat.update_trail(ltp)
                         if moved:
                             alert.send("⬆️ Stop moved up", f"{p.contract.symbol}: {moved}")
                             state.save(strat)
                 if strat.position and now.time() >= square_off:
-                    ltp = ltp or p.entry_price
-                    t = strat.close(ltp, now, "TIME_3:15")
-                    append_trade(t, "paper")
-                    _sell_alert(alert, t)
-                    state.save(strat)
+                    do_exit(ltp or p.entry_price, now, "TIME_3:15")
 
             # ---- once per minute, 3 seconds after the candle closes ----
             minute = now.replace(second=0, microsecond=0)
@@ -190,10 +264,7 @@ def run_live(cfg: dict) -> None:
                     cache.refresh([s], now)
                     if strat.red_line_exit(closed_upto(cache.data[s], close_ts)):
                         ltp = client.ltp([s]).get(s) or cache.data[s][-1]["c"]
-                        t = strat.close(ltp, now, "RED_LINE")
-                        append_trade(t, "paper")
-                        _sell_alert(alert, t)
-                        state.save(strat)
+                        do_exit(ltp, now, "RED_LINE")
                 elif strat.can_enter(now):
                     cache.refresh([idx], now)
                     index_c = closed_upto(cache.data.get(idx, []), close_ts)
@@ -201,13 +272,15 @@ def run_live(cfg: dict) -> None:
                         log("No Nifty index candles yet.")
                     else:
                         spot = index_c[-1]["c"]
-                        ce_k, pe_k = itm_strikes(spot, step)
+                        ce_k, pe_k = strikes_for(spot, step, strike_mode)
                         if lock:
                             if not state.locked:
                                 state.locked = {"CE": ce_k, "PE": pe_k}
                                 state.save(strat)
+                                watch = (f"{ce_k:.0f} (CE if Nifty goes up, PE if it goes down)" if ce_k == pe_k
+                                         else f"{ce_k:.0f} CE and {pe_k:.0f} PE")
                                 alert.send("📌 Today's strike",
-                                           f"Nifty {spot:.2f}. Watching only {ce_k:.0f} CE and {pe_k:.0f} PE "
+                                           f"Nifty {spot:.2f}. Watching only {watch} "
                                            f"(expiry {expiry:%d %b}) for the rest of the day.")
                             ce_k, pe_k = state.locked["CE"], state.locked["PE"]
                         picks = {t: pick(contracts, expiry, k, t) for t, k in (("CE", ce_k), ("PE", pe_k))}
@@ -220,8 +293,11 @@ def run_live(cfg: dict) -> None:
                             contract, reason = sig
                             ltp = client.ltp([contract.scrip]).get(contract.scrip) \
                                 or options[contract.opt_type][1][-1]["c"]
-                            if strat.open(contract, ltp, now, reason):
-                                _buy_alert(alert, strat.position)
+                            if not broker:
+                                if strat.open(contract, ltp, now, reason):
+                                    _buy_alert(alert, strat.position)
+                            else:
+                                buy_live(contract, ltp, now, reason)
                             state.save(strat)
                         elif minute.minute % 15 == 0:
                             log(f"Watching. Nifty {spot:.2f}, ITM CE {ce_k:.0f} / PE {pe_k:.0f}. No signal yet.")
@@ -230,13 +306,12 @@ def run_live(cfg: dict) -> None:
             _time.sleep(5)
         _time.sleep(1)
 
-    if strat.position:  # safety net
+    for _ in range(5):  # safety net: never leave the day with a position open
+        if not strat.position:
+            break
         p = strat.position
         ltp = client.ltp([p.contract.scrip]).get(p.contract.scrip) or p.entry_price
-        t = strat.close(ltp, datetime.now(IST), "TIME_3:15")
-        append_trade(t, "paper")
-        _sell_alert(alert, t)
-        state.save(strat)
+        do_exit(ltp, datetime.now(IST), getattr(p, "pending_exit", None) or "TIME_3:15")
     total = sum(t.net_pnl for t in strat.closed)
     if strat.trades_today == 0:
         alert.send("😴 No trade today", "No clear blue-line signal after 9:45, so no trade (your rule).")

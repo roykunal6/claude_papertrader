@@ -1,7 +1,9 @@
-"""Small read-only client for the INDstocks API.
+"""Small client for the INDstocks API.
 
-This bot only READS data (quotes, candles, instruments). It has no code that
-places, modifies or cancels orders, so it cannot trade real money.
+Market data calls (quotes, candles, instruments) are read-only. The order calls
+(place / modify / cancel) are used ONLY by bot/broker.py's LiveBroker, which runs
+only when you start `python run.py live` with [live] enabled = true and type the
+confirmation. `python run.py paper` never touches them.
 """
 from __future__ import annotations
 
@@ -36,20 +38,24 @@ class IndstocksClient:
 
     # ---------- plumbing ----------
     def _get(self, path: str, params: dict | None = None, expect_json: bool = True):
-        for attempt in range(5):
+        return self._request("GET", path, params=params, expect_json=expect_json)
+
+    def _request(self, method: str, path: str, params: dict | None = None, body: dict | None = None,
+                 expect_json: bool = True, retries: int = 5):
+        for attempt in range(retries):
             with self._lock:
                 wait = self._min_gap - (time.monotonic() - self._last_call)
                 if wait > 0:
                     time.sleep(wait)
                 self._last_call = time.monotonic()
             try:
-                r = self.session.get(self.base_url + path, params=params, timeout=15)
+                r = self.session.request(method, self.base_url + path, params=params, json=body, timeout=15)
             except requests.RequestException as e:
-                if attempt == 4:
+                if attempt == retries - 1:
                     raise ApiError(f"network error on {path}: {e}") from e
                 time.sleep(1 + attempt)
                 continue
-            if r.status_code == 429 or r.status_code >= 500:
+            if r.status_code == 429 or (r.status_code >= 500 and method == "GET"):
                 try:
                     wait = float(r.headers.get("Retry-After", ""))
                 except ValueError:
@@ -62,6 +68,36 @@ class IndstocksClient:
                 raise ApiError(f"{path}: HTTP {r.status_code}: {r.text[:300]}")
             return r.json() if expect_json else r.text
         raise ApiError(f"{path}: gave up after retries")
+
+    # ---------- account (read-only) ----------
+    def funds(self) -> dict:
+        return self._get("/funds").get("data") or {}
+
+    def positions(self) -> list[dict]:
+        return self._get("/portfolio/positions", {"segment": "derivative"}).get("data") or []
+
+    def order_book(self) -> list[dict]:
+        return self._get("/order-book").get("data") or []
+
+    def order(self, order_id: str) -> dict:
+        return self._request("GET", "/order", body={"order_id": order_id, "segment": "DERIVATIVE"}).get("data") or {}
+
+    # ---------- orders (REAL MONEY; used only by LiveBroker) ----------
+    # One attempt only: never auto-retry an order call, or a timeout could place it twice.
+    def place_order(self, txn_type: str, security_id: str, qty: int, limit_price: float, remarks: str) -> dict:
+        return self._request("POST", "/order", retries=1, body={
+            "txn_type": txn_type, "exchange": "NSE", "segment": "DERIVATIVE", "product": "INTRADAY",
+            "order_type": "LIMIT", "validity": "DAY", "security_id": str(security_id), "qty": int(qty),
+            "limit_price": float(limit_price), "is_amo": False, "remarks": remarks[:100]}).get("data") or {}
+
+    def modify_order(self, order_id: str, qty: int, limit_price: float) -> dict:
+        return self._request("POST", "/order/modify", retries=1, body={
+            "order_id": order_id, "segment": "DERIVATIVE", "qty": int(qty),
+            "limit_price": float(limit_price)}).get("data") or {}
+
+    def cancel_order(self, order_id: str) -> dict:
+        return self._request("POST", "/order/cancel", retries=1,
+                             body={"order_id": order_id, "segment": "DERIVATIVE"}).get("data") or {}
 
     # ---------- endpoints ----------
     def profile(self) -> dict:

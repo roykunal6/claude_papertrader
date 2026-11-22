@@ -58,7 +58,7 @@ def test_no_entry_before_945_and_one_trade_only():
         assert t.entry_time >= "09:45"
         assert t.exit_time <= "15:16"
         assert t.qty * t.entry_price <= 30000
-        assert t.exit_reason in {"TARGET", "STOP_LOSS", "RED_LINE", "TIME_3:15"}
+        assert t.exit_reason in {"TARGET", "STOP_LOSS", "TRAIL_STOP", "RED_LINE", "TIME_3:15"}
 
 
 def test_direction_follows_nifty():
@@ -159,3 +159,84 @@ def test_strike_locked_for_the_day():
     assert len(locked) == 1
     for t in trades:
         assert f"{t.strike:.0f} {t.opt_type}" in locked[0]
+
+
+# ---------------- one strike for CE and PE ----------------
+def test_single_strike_mode_uses_one_strike_for_both():
+    from bot.instruments import strikes_for
+    assert strikes_for(25812.0, 50, "single") == (25800.0, 25800.0)
+    assert strikes_for(25830.0, 50, "single") == (25850.0, 25850.0)
+    assert strikes_for(25812.0, 50, "lock") == (25800.0, 25850.0)
+    c = cfg()
+    c["trade"]["strike_mode"] = "single"
+    day, idx, opt, contracts, expiry = make_day(seed=7)
+    logs = []
+    simulate_day(c, day, idx, opt, contracts, expiry, log=logs.append)
+    locked = [m for m in logs if "locked for the day" in m]
+    assert len(locked) == 1
+    ce, pe = locked[0].split(": ")[1].split(" (")[0].replace(" CE", "").replace(" PE", "").split(" / ")
+    assert ce == pe
+
+
+# ---------------- real-order broker, against a fake account ----------------
+class FakeAccount:
+    """Pretends to be INDstocks. fill_ratio: share of each order that fills."""
+    def __init__(self, fill_ratio=1.0, reject=False):
+        self.orders, self.fill_ratio, self.reject = {}, fill_ratio, reject
+
+    def place_order(self, txn_type, security_id, qty, limit_price, remarks):
+        from bot.indstocks import ApiError
+        if self.reject:
+            raise ApiError("/order: HTTP 403: static IP not whitelisted")
+        oid = f"DRV-{len(self.orders) + 1}"
+        filled = int(qty * self.fill_ratio) // 65 * 65
+        self.orders[oid] = {"status": "COMPLETE" if filled == qty else "OPEN", "traded_qty": filled,
+                            "traded_price": limit_price, "txn_type": txn_type, "remarks": remarks, "qty": qty,
+                            "security_id": security_id}
+        return {"order_id": oid, "order_status": "INITIATED"}
+
+    def order(self, oid):
+        return self.orders[oid]
+
+    def cancel_order(self, oid):
+        if self.orders[oid]["status"] != "COMPLETE":
+            self.orders[oid]["status"] = "CANCELLED"
+        return {}
+
+
+def _contract():
+    from bot.instruments import Contract
+    return Contract("NFO_64489", "NIFTY-Nov2026-25800-CE", 25800.0, "CE", date(2026, 11, 30), 65)
+
+
+def test_live_buy_fills_with_limit_order_and_right_security_id():
+    from bot.broker import LiveBroker
+    acct = FakeAccount()
+    b = LiveBroker(acct, cfg() | {"live": {"limit_buffer_pct": 1.0}}, log=lambda m: None, sleep=lambda s: None)
+    f = b.buy(_contract(), 130, 200.0)
+    assert (f.qty, f.price) == (130, 202.0)
+    o = acct.orders[f.order_id]
+    assert o["security_id"] == "64489" and o["txn_type"] == "BUY" and "nifty-bot" in o["remarks"]
+
+
+def test_live_buy_rejected_buys_nothing():
+    from bot.broker import LiveBroker
+    b = LiveBroker(FakeAccount(reject=True), cfg(), log=lambda m: None, sleep=lambda s: None)
+    f = b.buy(_contract(), 130, 200.0)
+    assert f.qty == 0 and "static IP" in f.note
+
+
+def test_live_sell_retries_until_all_sold():
+    from bot.broker import LiveBroker
+    acct = FakeAccount(fill_ratio=0.5)
+    b = LiveBroker(acct, cfg(), log=lambda m: None, sleep=lambda s: None)
+    f = b.sell(_contract(), 260, 200.0)
+    assert f.qty == 260 - 65  # 130, then 65, then 0 of the last 65 (half of 65 rounds down)
+    assert len(acct.orders) == 3 and all(o["txn_type"] == "SELL" for o in acct.orders.values())
+
+
+def test_paper_command_never_creates_a_broker():
+    import inspect
+    from bot import live
+    src = inspect.getsource(live.run_live)
+    assert "LiveBroker(client, cfg, log) if live else None" in src

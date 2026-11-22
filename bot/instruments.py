@@ -89,6 +89,19 @@ def itm_strikes(spot: float, step: int) -> tuple[float, float]:
     return float(ce), float(pe)
 
 
+def day_strike(spot: float, step: int) -> float:
+    """The one strike traded all day: the strike nearest to Nifty (used for both CE and PE)."""
+    return float(round(spot / step) * step)
+
+
+def strikes_for(spot: float, step: int, mode: str) -> tuple[float, float]:
+    """(CE strike, PE strike) to watch. "single": one strike for both. Otherwise the ITM pair."""
+    if mode == "single":
+        k = day_strike(spot, step)
+        return k, k
+    return itm_strikes(spot, step)
+
+
 def pick(contracts: list[Contract], expiry: date, strike: float, opt_type: str) -> Contract | None:
     for c in contracts:
         if c.expiry == expiry and c.opt_type == opt_type and abs(c.strike - strike) < 0.01:

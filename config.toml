@@ -13,13 +13,14 @@ square_off = "15:15"        # close any open trade at this time
 [trade]
 max_trades_per_day = 1
 target_pct = 15.0           # exit when the option is up 15%
-stop_loss_pct = 7.0         # exit when the option is down 7%  (PLEASE CONFIRM)
+stop_loss_pct = 7.0         # exit when the option is down 7%
 exit_on_red_line = true     # cheat-sheet rule: exit if the 1-min line turns red and a candle closes below it
 skip_expiry_day = true      # no trading on Nifty expiry days
 strike_step = 50
-# "lock": pick the in-the-money strike once at 09:45 and watch only that strike all day.
-# "follow": re-pick the in-the-money strike every minute as Nifty moves.
-strike_mode = "lock"            # Nifty strikes are 50 points apart
+# "single": at 09:45 pick ONE strike (the one nearest Nifty) and trade only its CE or PE all day.
+# "lock": at 09:45 pick the in-the-money CE strike and the in-the-money PE strike, keep both all day.
+# "follow": re-pick the in-the-money strikes every minute as Nifty moves.
+strike_mode = "single"                                     # Nifty strikes are 50 points apart
 underlying = "NIFTY"
 
 [trail]
@@ -43,6 +44,15 @@ length = 11
 require_index_agreement = true
 # "Establish a trend first": Nifty's line must have held that colour for at least this many 1-min candles.
 index_trend_min_candles = 5
+
+[live]
+# REAL MONEY. Leave this false until you've watched paper trading for a while.
+# Even when true, the bot only trades live if you run `python run.py live`
+# and type the confirmation that morning. `python run.py paper` never places orders.
+enabled = false
+limit_buffer_pct = 1.0     # buy limit 1% above / sell limit 1% below the last price, so it fills at once
+fill_wait_seconds = 10     # how long to wait for a fill before cancelling or re-pricing
+max_qty_per_order = 1755   # stay under NSE's Nifty freeze limit (27 lots of 65)
 
 [paper]
 slippage_pct = 0.3          # assume we buy 0.3% above and sell 0.3% below the last price

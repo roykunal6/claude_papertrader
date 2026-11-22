@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 
-from .instruments import Contract, itm_strikes, pick
+from .instruments import Contract, itm_strikes, pick, strikes_for
 from .strategy import IST, Strategy, Trade, hhmm
 
 
@@ -58,11 +58,12 @@ def simulate_day(cfg: dict, day: date, index_candles: list[dict],
             break
         if not strat.can_enter(now):
             continue
-        ce_k, pe_k = itm_strikes(bar["c"], step)
-        if cfg["trade"].get("strike_mode", "follow") == "lock":
+        mode = cfg["trade"].get("strike_mode", "follow")
+        ce_k, pe_k = strikes_for(bar["c"], step, mode)
+        if mode in ("lock", "single"):
             if not locked:
                 locked.update(CE=ce_k, PE=pe_k)
-                log(f"{now:%H:%M} Strikes locked for the day: {ce_k:.0f} CE / {pe_k:.0f} PE (Nifty {bar['c']:.2f})")
+                log(f"{now:%H:%M} Strike locked for the day: {ce_k:.0f} CE / {pe_k:.0f} PE (Nifty {bar['c']:.2f})")
             ce_k, pe_k = locked["CE"], locked["PE"]
         options = {}
         for opt_type, k in (("CE", ce_k), ("PE", pe_k)):
@@ -85,7 +86,7 @@ def strikes_needed(index_candles_today: list[dict], step: int) -> set[float]:
     for c in index_candles_today:
         for price in (c["h"], c["l"], c["c"]):
             ce, pe = itm_strikes(price, step)
-            ks.update({ce, pe})
+            ks.update({ce, pe, float(round(price / step) * step)})
     return ks
 
 
