@@ -53,6 +53,15 @@ Trades only when Nifty's trend is clear, and holds winners with a trailing stop.
    (the averages cross back). There's no fixed target.
 4. Up to **3 trades a day**, but it stops for the day after 2 losing trades or ₹5,000 lost.
 
+## The third option: Afternoon momentum (`name = "late"`, or `"orb+late"` for both)
+
+Based on a well-known study ("Market Intraday Momentum", Journal of Financial Economics, 2018): the market's
+early move tends to carry on into the last half hour.
+- At 14:45, if Nifty is up at least 0.2% from yesterday's close by 09:45 **and** still rising over the last
+  30 minutes, buy the in-the-money **CALL**. Both down: the **PUT**. Mixed: no trade.
+- Exit at 15:15, or earlier if Nifty moves 30 points against it. One such trade a day.
+- `"orb+late"` runs the morning breakout and this afternoon trade on the same day (they never overlap).
+
 ## Expiry days
 `skip_expiry_day = false` trades on expiry days too. On those days it uses **next week's** contract
 (`expiry_day_contract = "next"`), because the expiring one can lose most of its value in minutes.
@@ -63,8 +72,9 @@ python run.py compare 12months
 ```
 This downloads each day once (into `data/cache`, so later runs take a minute), then tests every version on
 exactly the same days: the breakout as tested, the breakout with expiry days, the breakout with a trailing stop,
-and the trend strategy with 3 or 1 trades a day. It also runs an **honesty check**: it tries 27 trend settings on
-the earlier half of the year, picks the best, and shows how that pick did on the later half, which it never saw.
+the trend strategy with 3 or 1 trades a day, and afternoon momentum alone and with the breakout. It also runs an
+**honesty check**: it tries 27 settings each of the trend and afternoon strategies on the earlier half of the year,
+picks the best, and shows how that pick did on the later half, which it never saw.
 If a version only looks good on the half it was picked on, that was luck.
 
 ## One-time setup (about 15 minutes)

@@ -8,6 +8,8 @@ max_invested = 30000   # the bot never spends more than this on one trade
 [strategy]
 # "orb"   = Opening Range Breakout: at most 1 trade a day, on a clean break of the 09:15-09:45 range.
 # "trend" = Trend-following: only in a clear trend, up to 3 trades a day, trailing stop, no fixed target.
+# "late"  = Afternoon momentum only: one trade at 14:45 if the morning and afternoon moves agree, out by 15:15.
+# "orb+late" = both: the breakout in the morning, plus the afternoon trade.
 # Run  python run.py compare 12months  to see how each one did on the same days before you choose.
 name = "orb"
 
@@ -64,6 +66,17 @@ breakeven_r = 1.0           # after 1x the risk in profit, the stop moves to the
 trail_start_r = 1.0         # then trails...
 trail_r = 1.5               # ...1.5x the risk behind the best Nifty price, never moving back
 exit_on_trend_end = true    # also exit when the 9-avg crosses back over the 21-avg
+
+[late]
+# Afternoon momentum (Gao, Han, Li & Zhou, Journal of Financial Economics 2018).
+entry_time = "14:45"        # check once, at this 5-min close; exit at the square-off time (15:15)
+morning_end = "09:45"       # morning move = yesterday's close to this time
+lookback_min = 30           # afternoon move = the last 30 minutes before entry_time
+min_morning_pct = 0.2       # morning move must be at least this big (%)
+min_afternoon_pct = 0.05    # and the afternoon move must point the same way, at least this much (%)
+stop_pts = 30               # exit early if Nifty moves this many points against the trade
+breakeven_r = 99            # (no breakeven or trailing: it's a 30-minute trade)
+trail_r = 0
 
 [alerts]
 mac_popup = true         # pop-up with a sound on your Mac
