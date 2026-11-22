@@ -39,25 +39,33 @@ def load_config() -> dict:
 
 def cmd_check(cfg: dict) -> None:
     from bot.indstocks import IndstocksClient
-    from bot.instruments import load_nifty_options, nearest_expiry
+    from bot.instruments import itm_strikes, nearest_expiry, pick
+    from bot.market import load_contracts
     from bot.strategy import IST
     client = IndstocksClient.from_env(cfg["api"]["base_url"])
     client.profile()
     print("1. Token works.")
-    contracts = load_nifty_options(client.fno_instruments_csv(), cfg["trade"]["underlying"])
+    contracts = load_contracts(client, cfg, log=lambda m: print("   " + m))
     today = datetime.now(IST).date()
     exp = nearest_expiry(contracts, today)
     print(f"2. Found {len(contracts)} Nifty option contracts. Nearest expiry: {exp}. "
           f"Lot size: {contracts[0].lot_size if contracts else '?'}")
     idx = cfg["api"]["index_scrip"]
-    try:
-        print(f"3. Nifty index ({idx}) last price: {client.ltp([idx]).get(idx)}")
-    except Exception as e:  # noqa: BLE001
-        print(f"3. PROBLEM reading the Nifty index with code {idx}: {e}")
+    spot = client.ltp([idx]).get(idx)
+    print(f"3. Nifty index ({idx}) last price: {spot}" + ("" if spot else f"  errors: {client.last_errors}"))
     end = int(datetime.now(IST).timestamp() * 1000)
     got = client.candles([idx], end - 4 * 86400 * 1000, end)
-    print(f"4. Got {len(got.get(idx, []))} one-minute Nifty candles for the last 4 days.")
-    print("All good." if got.get(idx) else "No candles returned; tell Claude what you see.")
+    n = len(got.get(idx, []))
+    print(f"4. Got {n} one-minute Nifty candles for the last 4 days." + ("" if n else f"  errors: {client.last_errors}"))
+    if spot and exp:
+        ce_k, _ = itm_strikes(spot, cfg["trade"]["strike_step"])
+        c = pick(contracts, exp, ce_k, "CE")
+        if c:
+            oc = client.candles([c.scrip], end - 4 * 86400 * 1000, end).get(c.scrip, [])
+            ltp = client.ltp([c.scrip]).get(c.scrip)
+            print(f"5. Option {c.symbol} ({c.scrip}): last price {ltp}, {len(oc)} one-minute candles."
+                  + ("" if oc else f"  errors: {client.last_errors}"))
+    print("All good." if n and contracts else "Something is missing above; send this to Claude.")
 
 
 def replay_day(cfg: dict, client, contracts, day: date, log=print):
@@ -91,9 +99,9 @@ def replay_day(cfg: dict, client, contracts, day: date, log=print):
 
 def _client_and_contracts(cfg: dict):
     from bot.indstocks import IndstocksClient
-    from bot.instruments import load_nifty_options
+    from bot.market import load_contracts
     client = IndstocksClient.from_env(cfg["api"]["base_url"])
-    return client, load_nifty_options(client.fno_instruments_csv(), cfg["trade"]["underlying"])
+    return client, load_contracts(client, cfg)
 
 
 def _print_trade(t) -> None:

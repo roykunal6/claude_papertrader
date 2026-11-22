@@ -7,8 +7,9 @@ import math
 from dataclasses import dataclass
 from datetime import date, datetime
 
-DATE_FORMATS = ("%Y-%m-%d", "%d-%m-%Y", "%d-%b-%Y", "%d %b %Y", "%Y-%m-%d %H:%M:%S",
-                "%d/%m/%Y", "%Y%m%d", "%d%b%Y")
+# INDstocks sends EXPIRY_DATE as "12/01/2026 14:00" (month/day/year) and EXPIRY_CODE as "01 Dec 2026".
+DATE_FORMATS = ("%m/%d/%Y %H:%M", "%m/%d/%Y", "%d %b %Y", "%Y-%m-%d", "%Y-%m-%d %H:%M:%S",
+                "%d-%b-%Y", "%Y%m%d")
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,13 @@ def parse_date(text: str) -> date:
     raise ValueError(f"unrecognised expiry date format: {text!r}")
 
 
+def _expiry(row: dict) -> date:
+    try:
+        return parse_date(row["EXPIRY_DATE"])
+    except (KeyError, ValueError):
+        return parse_date(row["EXPIRY_CODE"])
+
+
 def _is_underlying(row: dict, underlying: str) -> bool:
     u = underlying.upper()
     for key in ("SYMBOL_NAME", "UNDERLYING_SCRIP_NAME"):
@@ -40,7 +48,7 @@ def _is_underlying(row: dict, underlying: str) -> bool:
     return False
 
 
-def load_nifty_options(csv_text: str, underlying: str = "NIFTY") -> list[Contract]:
+def load_nifty_options(csv_text: str, underlying: str = "NIFTY", prefix: str = "NFO") -> list[Contract]:
     out: list[Contract] = []
     for row in csv.DictReader(io.StringIO(csv_text)):
         row = {k.strip(): (v or "") for k, v in row.items() if k}
@@ -53,11 +61,11 @@ def load_nifty_options(csv_text: str, underlying: str = "NIFTY") -> list[Contrac
             continue
         try:
             out.append(Contract(
-                scrip=f"NFO_{row['SECURITY_ID'].strip()}",
+                scrip=f"{prefix}_{row['SECURITY_ID'].strip()}",
                 symbol=row.get("TRADING_SYMBOL", "").strip(),
                 strike=float(row["STRIKE_PRICE"]),
                 opt_type=opt,
-                expiry=parse_date(row["EXPIRY_DATE"]),
+                expiry=_expiry(row),
                 lot_size=int(float(row["LOT_UNITS"])),
             ))
         except (KeyError, ValueError):

@@ -41,4 +41,5 @@ gst_pct = 18.0
 
 [api]
 base_url = "https://api.indstocks.com"
-index_scrip = "NSE_40000001"  # NIFTY 50 index (check with: python run.py check)
+option_prefix = "auto"        # "NFO", "NSE" or "auto" (detect at start)
+index_scrip = "NIDX_40000001"  # NIFTY 50 index (confirmed from INDstocks, 22 Nov 2026)

@@ -110,3 +110,19 @@ def test_instrument_csv_parsing():
     got = load_nifty_options("\n".join([header, *rows]))
     assert len(got) == 1
     assert got[0].scrip == "NFO_51011" and got[0].lot_size == 65 and got[0].expiry == date(2026, 11, 24)
+
+
+def test_real_indstocks_csv_rows():
+    # rows copied from the real INDstocks instrument list (22 Nov 2026)
+    header = ("EXCH,SEGMENT,SECURITY_ID,INSTRUMENT_NAME,EXPIRY_CODE,TRADING_SYMBOL,LOT_UNITS,CUSTOM_SYMBOL,"
+              "EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,TICK_SIZE,EXPIRY_FLAG,SEM_EXCH_INSTRUMENT_TYPE,SERIES,"
+              "SYMBOL_NAME,UNDERLYING_SCRIP_NAME,FREEZE_QTY,UPPER_LIMIT,LOWER_LIMIT,ISIN,GENERAL_FACTOR,DELIVERY_UNIT")
+    rows = [
+        "NSE,D,84762,OPTSTK,29 Dec 2026,CROMPTON-Dec2026-162.5-CE,2150,CROMPTON 29 DEC 162.5 CE,12/29/2026 14:00,162.50000,CE,1,M,OPTSTK,,,CROMPT GREA CON ELEC LTD,116251,81.96,41.96,,0,",
+        "NSE,D,48030,OPTIDX,01 Dec 2026,NIFTY-Dec2026-27950-CE,65,NIFTY 1 DEC 27950 CE,12/01/2026 14:00,27950.00000,CE,5,W,OPTIDX,,,NIFTY,1801,20.25,0.05,,0,",
+        "NSE,D,67889,OPTIDX,29 Dec 2026,NIFTYNXT50-Dec2026-78700-PE,25,NIFTYNXT50 29 DEC 78700 PE,12/29/2026 14:00,78700.00000,PE,5,M,OPTIDX,,,NIFTYNXT50,601,7413.95,3421.85,,0,",
+    ]
+    got = load_nifty_options("\n".join([header, *rows]))
+    assert len(got) == 1
+    c = got[0]
+    assert c.expiry == date(2026, 12, 1) and c.strike == 27950 and c.lot_size == 65 and c.opt_type == "CE"

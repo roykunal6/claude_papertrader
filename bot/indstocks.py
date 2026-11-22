@@ -23,7 +23,8 @@ class IndstocksClient:
         self.session.headers.update({"Authorization": token, "Accept": "application/json"})
         self._lock = threading.Lock()
         self._last_call = 0.0
-        self._min_gap = 0.25  # stay under 5 requests/second
+        self.last_errors: dict = {}  # per-instrument errors from the last quote/candle call
+        self._min_gap = 0.4  # stay well under the 5 requests/second limit
 
     # ---------- auth ----------
     @classmethod
@@ -49,7 +50,11 @@ class IndstocksClient:
                 time.sleep(1 + attempt)
                 continue
             if r.status_code == 429 or r.status_code >= 500:
-                time.sleep(1 + attempt * 2)
+                try:
+                    wait = float(r.headers.get("Retry-After", ""))
+                except ValueError:
+                    wait = 1.5 * (attempt + 1)
+                time.sleep(max(wait, 1.0))
                 continue
             if r.status_code in (401, 403):
                 raise ApiError(f"{path}: token rejected ({r.status_code}). Refresh INDSTOCKS_ACCESS_TOKEN. {r.text[:200]}")
@@ -67,6 +72,7 @@ class IndstocksClient:
 
     def ltp(self, scrips: list[str]) -> dict[str, float]:
         body = self._get("/market/quotes/ltp", {"scrip-codes": ",".join(scrips)})
+        self.last_errors = body.get("errors") or {}
         data = body.get("data") or {}
         out = {}
         for code, v in data.items():
@@ -81,12 +87,25 @@ class IndstocksClient:
             chunk = scrips[i:i + 5]
             body = self._get(f"/market/historical/{interval}", {
                 "scrip-codes": ",".join(chunk), "start_time": start_ms, "end_time": end_ms})
+            self.last_errors = body.get("errors") or {}
             for code, v in (body.get("data") or {}).items():
                 rows = (v or {}).get("candles") or []
                 out[code] = [{"ts": int(c["ts"]), "o": float(c["o"]), "h": float(c["h"]),
                               "l": float(c["l"]), "c": float(c["c"]), "v": float(c.get("v") or 0)}
                              for c in rows]
         return out
+
+
+def detect_option_prefix(client: "IndstocksClient", security_id: str) -> str:
+    """Options may be quoted as NFO_<id> or NSE_<id>; try both and keep the one that answers."""
+    for prefix in ("NFO", "NSE"):
+        code = f"{prefix}_{security_id}"
+        try:
+            if client.ltp([code]).get(code) is not None:
+                return prefix
+        except ApiError:
+            pass
+    raise ApiError(f"Couldn't get a quote for option {security_id} as NFO_ or NSE_. Last errors: {client.last_errors}")
 
 
 def generate_token_from_totp(base_url: str) -> str:

@@ -9,7 +9,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from .indstocks import ApiError, IndstocksClient
-from .instruments import Contract, itm_strikes, load_nifty_options, nearest_expiry, pick
+from .instruments import Contract, itm_strikes, nearest_expiry, pick
+from .market import load_contracts
 from .replay import closed_upto
 from .strategy import IST, Position, Strategy, Trade, hhmm
 
@@ -102,7 +103,7 @@ def run_live(cfg: dict) -> None:
     client.profile()
     log("API token OK.")
 
-    contracts = load_nifty_options(client.fno_instruments_csv(), cfg["trade"]["underlying"])
+    contracts = load_contracts(client, cfg, log)
     expiry = nearest_expiry(contracts, today)
     if not contracts or not expiry:
         log("Couldn't find Nifty option contracts in the instrument list. Stopping.")
