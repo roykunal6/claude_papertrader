@@ -28,6 +28,7 @@ def simulate_day(cfg: dict, day: date, index_candles: list[dict],
         log(f"No Nifty candles for {day} (holiday or no data).")
         return []
 
+    locked: dict[str, float] = {}
     for bar in today:
         close_ts = bar["ts"] + 60
         now = datetime.fromtimestamp(close_ts, IST)
@@ -37,12 +38,17 @@ def simulate_day(cfg: dict, day: date, index_candles: list[dict],
             held = option_candles.get(p.contract.scrip, [])
             this = next((c for c in held if c["ts"] == bar["ts"]), None)
             if this:
-                if this["l"] <= p.stop:          # assume the stop is hit first (cautious)
-                    strat.close(min(p.stop, this["o"]), now, "STOP_LOSS", exact=True)
-                elif this["h"] >= p.target:
+                reason = strat.check_price(this["l"])   # cautious: assume the low came first
+                if reason in ("STOP_LOSS", "TRAIL_STOP"):
+                    strat.close(min(p.stop, this["o"]), now, reason, exact=True)
+                elif strat.check_price(this["h"]) == "TARGET":
                     strat.close(max(p.target, this["o"]), now, "TARGET", exact=True)
-                elif strat.red_line_exit(closed_upto(held, close_ts)):
-                    strat.close(this["c"], now, "RED_LINE")
+                else:
+                    msg = strat.update_trail(this["h"])
+                    if msg:
+                        log(f"{now:%H:%M} {msg}")
+                    if strat.red_line_exit(closed_upto(held, close_ts)):
+                        strat.close(this["c"], now, "RED_LINE")
             if strat.position and now.time() >= square_off:
                 last = closed_upto(held, close_ts)
                 strat.close(last[-1]["c"] if last else p.entry_price, now, "TIME_3:15")
@@ -53,6 +59,11 @@ def simulate_day(cfg: dict, day: date, index_candles: list[dict],
         if not strat.can_enter(now):
             continue
         ce_k, pe_k = itm_strikes(bar["c"], step)
+        if cfg["trade"].get("strike_mode", "follow") == "lock":
+            if not locked:
+                locked.update(CE=ce_k, PE=pe_k)
+                log(f"{now:%H:%M} Strikes locked for the day: {ce_k:.0f} CE / {pe_k:.0f} PE (Nifty {bar['c']:.2f})")
+            ce_k, pe_k = locked["CE"], locked["PE"]
         options = {}
         for opt_type, k in (("CE", ce_k), ("PE", pe_k)):
             c = pick(contracts, expiry, k, opt_type)

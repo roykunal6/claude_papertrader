@@ -39,6 +39,8 @@ class Position:
     stop: float
     entry_charges: float
     reason: str
+    peak: float = 0.0           # highest price since entry (for the trailing stop)
+    initial_stop: float = 0.0
 
 
 @dataclass
@@ -152,25 +154,56 @@ class Strategy:
         tr = self.cfg["trade"]
         self.position = Position(
             contract=contract, qty=qty, entry_price=price, entry_time=now,
-            target=round(price * (1 + tr["target_pct"] / 100), 2),
-            stop=round(price * (1 - tr["stop_loss_pct"] / 100), 2),
+            target=round(round(price * (1 + tr["target_pct"] / 100) / 0.05) * 0.05, 2),
+            stop=round(round(price * (1 - tr["stop_loss_pct"] / 100) / 0.05) * 0.05, 2),
             entry_charges=order_charges(price * qty, "BUY", self.cfg["charges"]),
             reason=reason)
+        self.position.peak = price
+        self.position.initial_stop = self.position.stop
         self.trades_today += 1
         p = self.position
         self.log(f"{now:%H:%M:%S} PAPER BUY {qty} x {contract.symbol} @ ₹{price} "
                  f"(₹{price * qty:,.0f}). Target ₹{p.target}, stop ₹{p.stop}. Why: {reason}")
         return p
 
+    def update_trail(self, price: float) -> str | None:
+        """Raise the stop as the option rises. Never lowers it. Returns a message if it moved.
+
+        Conservative trailing rule (config [trail]):
+          * up breakeven_at_pct  -> stop moves to the entry price (can't lose on the trade)
+          * after that           -> stop follows trail_pct below the highest price seen
+          * past the target      -> (target_mode = "trail") the gap tightens to tight_trail_pct
+        """
+        p = self.position
+        tr = self.cfg.get("trail", {})
+        if not p or not tr.get("enabled", False):
+            return None
+        p.peak = max(p.peak, price)
+        gain = (p.peak / p.entry_price - 1) * 100
+        new_stop = p.stop
+        if gain >= tr.get("breakeven_at_pct", 5):
+            new_stop = max(new_stop, p.entry_price)
+            gap = tr.get("trail_pct", 7)
+            if gain >= self.cfg["trade"]["target_pct"] and tr.get("target_mode", "exit") == "trail":
+                gap = tr.get("tight_trail_pct", 4)
+            new_stop = max(new_stop, p.peak * (1 - gap / 100))
+        new_stop = round(round(new_stop / 0.05) * 0.05, 2)
+        if new_stop > p.stop + 0.001:
+            old, p.stop = p.stop, new_stop
+            return f"Stop raised ₹{old} -> ₹{new_stop} (high so far ₹{p.peak:.2f}, up {gain:.1f}%)"
+        return None
+
     def check_price(self, ltp: float) -> str | None:
         """Exit reason if the live price has hit the target or stop, else None."""
         p = self.position
         if not p:
             return None
-        if ltp >= p.target:
+        trail_on = self.cfg.get("trail", {}).get("enabled", False)
+        target_exits = not trail_on or self.cfg["trail"].get("target_mode", "exit") == "exit"
+        if target_exits and ltp >= p.target:
             return "TARGET"
         if ltp <= p.stop:
-            return "STOP_LOSS"
+            return "TRAIL_STOP" if p.stop > p.initial_stop else "STOP_LOSS"
         return None
 
     def close(self, market_price: float, now: datetime, reason: str, exact: bool = False) -> Trade:

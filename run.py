@@ -5,6 +5,8 @@
   python run.py replay 2026-11-19     replay a past day with the same rules
   python run.py backtest 2026-11-16 2026-11-20   replay every day in a date range, with a summary
   python run.py export 2026-11-20     save that day's Nifty 1-min candles to a CSV
+  python run.py export 2026-11-20 25400 PE   same, for one option
+  python run.py test-alert            send a test alert (Mac pop-up, voice, Telegram)
   python run.py debug                 print raw API answers to help fix data problems
   python run.py demo                  run on a made-up day, no API needed
 """
@@ -203,23 +205,41 @@ def cmd_debug(cfg: dict) -> None:
     print("\nDone. Copy everything above and send it to Claude. It contains no token or account details.")
 
 
-def cmd_export(cfg: dict, day: date) -> None:
+def cmd_export(cfg: dict, day: date, option: list | None = None) -> None:
     """Save that day's Nifty 1-min candles to a CSV, to compare against the INDstocks chart."""
     import csv
     from bot.indstocks import IndstocksClient
     from bot.replay import day_window_ms
     from bot.strategy import IST
     client = IndstocksClient.from_env(cfg["api"]["base_url"])
-    idx = cfg["api"]["index_scrip"]
     start, end = day_window_ms(day, warmup_days=4)
-    rows = client.candles([idx], start, end).get(idx, [])
-    out = ROOT / f"nifty_{day:%Y-%m-%d}.csv"
+    code, name = cfg["api"]["index_scrip"], "nifty"
+    if option:
+        from bot.instruments import nearest_expiry, pick
+        from bot.market import load_contracts
+        strike, opt_type = float(option[0]), option[1].upper()
+        contracts = load_contracts(client, cfg)
+        c = pick(contracts, nearest_expiry(contracts, day), strike, opt_type)
+        if not c:
+            print(f"No live contract for {strike:.0f} {opt_type} on the expiry after {day}.")
+            return
+        code, name = c.scrip, f"nifty_{strike:.0f}{opt_type}"
+    rows = client.candles([code], start, end).get(code, [])
+    out = ROOT / f"{name}_{day:%Y-%m-%d}.csv"
     with out.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["time_ist", "open", "high", "low", "close", "volume"])
         for c in rows:
             w.writerow([f"{datetime.fromtimestamp(c['ts'], IST):%Y-%m-%d %H:%M}", c["o"], c["h"], c["l"], c["c"], c["v"]])
     print(f"Saved {len(rows)} candles (that day plus 4 days before, for warm-up) to {out}")
+
+
+def cmd_test_alert(cfg: dict) -> None:
+    from bot.alerts import Alerter
+    a = Alerter(cfg)
+    a.send("🟢 TEST ALERT", "If you can see and hear this, alerts work. Nothing was bought.", speak="This is a test alert.")
+    print("Mac pop-up:", "on" if a.mac else "off (not a Mac or turned off)",
+          "| Telegram:", "on" if (a.telegram_token and a.telegram_chat) else "off (no TELEGRAM_* in .env)")
 
 
 def cmd_demo(cfg: dict) -> None:
@@ -250,7 +270,9 @@ def main(argv: list[str]) -> None:
     elif cmd == "debug":
         cmd_debug(cfg)
     elif cmd == "export" and len(argv) > 2:
-        cmd_export(cfg, date.fromisoformat(argv[2]))
+        cmd_export(cfg, date.fromisoformat(argv[2]), argv[3:5] if len(argv) > 4 else None)
+    elif cmd in ("test-alert", "alert"):
+        cmd_test_alert(cfg)
     elif cmd == "demo":
         cmd_demo(cfg)
     else:

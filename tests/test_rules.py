@@ -90,8 +90,10 @@ def test_target_and_stop_levels():
     s = Strategy(c, log=lambda m: None)
     now = datetime(2026, 11, 19, 10, 0, tzinfo=IST)
     p = s.open(contracts[0], 100.0, now, "test")
-    assert abs(p.target - p.entry_price * 1.15) < 0.01
-    assert abs(p.stop - p.entry_price * 0.93) < 0.01
+    assert abs(p.target - p.entry_price * 1.15) < 0.03
+    assert abs(p.stop - p.entry_price * 0.93) < 0.03
+    assert s.check_price(p.target) is None          # trail mode: keep riding past +15%
+    s.cfg = {**c, "trail": {**c["trail"], "target_mode": "exit"}}
     assert s.check_price(p.target) == "TARGET"
     assert s.check_price(p.stop) == "STOP_LOSS"
     assert s.check_price(p.entry_price) is None
@@ -126,3 +128,34 @@ def test_real_indstocks_csv_rows():
     assert len(got) == 1
     c = got[0]
     assert c.expiry == date(2026, 12, 1) and c.strike == 27950 and c.lot_size == 65 and c.opt_type == "CE"
+
+
+def test_trailing_stop_only_moves_up():
+    c = cfg()
+    day, idx, opt, contracts, expiry = make_day(seed=7)
+    s = Strategy(c, log=lambda m: None)
+    now = datetime(2026, 11, 19, 10, 0, tzinfo=IST)
+    p = s.open(contracts[0], 100.0, now, "test")
+    entry = p.entry_price
+    assert s.update_trail(entry * 1.03) is None               # +3%: stop unchanged
+    assert s.update_trail(entry * 1.06) is not None           # +6%: stop to breakeven or better
+    assert p.stop >= entry
+    s.update_trail(entry * 1.12)                              # +12%: stop 7% under the high
+    assert abs(p.stop - entry * 1.12 * 0.93) < 0.1
+    before = p.stop
+    s.update_trail(entry * 1.01)                              # price falls back: stop stays
+    assert p.stop == before
+    assert s.check_price(before - 0.05) == "TRAIL_STOP"
+    s.update_trail(entry * 1.20)                              # past +15%: tighter 4% gap
+    assert abs(p.stop - entry * 1.20 * 0.96) < 0.1
+
+
+def test_strike_locked_for_the_day():
+    up = [25000.0 + 1.5 * i for i in range(375)]           # Nifty climbs 560 points
+    day, idx, opt, contracts, expiry = make_day(path=up)
+    logs = []
+    trades = simulate_day(cfg(), day, idx, opt, contracts, expiry, log=logs.append)
+    locked = [m for m in logs if "locked" in m]
+    assert len(locked) == 1
+    for t in trades:
+        assert f"{t.strike:.0f} {t.opt_type}" in locked[0]

@@ -16,8 +16,24 @@ target_pct = 15.0           # exit when the option is up 15%
 stop_loss_pct = 7.0         # exit when the option is down 7%  (PLEASE CONFIRM)
 exit_on_red_line = true     # cheat-sheet rule: exit if the 1-min line turns red and a candle closes below it
 skip_expiry_day = true      # no trading on Nifty expiry days
-strike_step = 50            # Nifty strikes are 50 points apart
+strike_step = 50
+# "lock": pick the in-the-money strike once at 09:45 and watch only that strike all day.
+# "follow": re-pick the in-the-money strike every minute as Nifty moves.
+strike_mode = "lock"            # Nifty strikes are 50 points apart
 underlying = "NIFTY"
+
+[trail]
+# Conservative trailing stop: lets a winner keep running while the line stays blue.
+enabled = true
+breakeven_at_pct = 5     # once up 5%, the stop moves to your buy price (can't lose)
+trail_pct = 7            # then the stop follows 7% below the highest price reached
+target_mode = "trail"    # at +15%: "trail" = keep riding with a tighter stop, "exit" = sell right away
+tight_trail_pct = 4      # after +15%, the stop follows 4% below the high
+
+[alerts]
+mac_popup = true         # pop-up with a sound on your Mac
+mac_voice = true         # your Mac says "Buy now" / "Sell now" out loud
+# Telegram: put TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env (see README)
 
 [indicator]
 # Look-alike of TrendIkaterr. "ema" or "hma" (Hull, faster). Length 11 matches "TRENDIKATERR 11".

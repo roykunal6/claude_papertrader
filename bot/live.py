@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .indstocks import ApiError, IndstocksClient
 from .instruments import Contract, itm_strikes, nearest_expiry, pick
+from .alerts import Alerter, contract_label
 from .market import load_contracts
 from .replay import closed_upto
 from .strategy import IST, Position, Strategy, Trade, hhmm
@@ -46,6 +47,7 @@ class StateFile:
     def __init__(self, day: date):
         self.path = ROOT / "state.json"
         self.day = day.isoformat()
+        self.locked: dict = {}
 
     def load(self, strat: Strategy) -> None:
         if not self.path.exists():
@@ -54,6 +56,7 @@ class StateFile:
         if s.get("day") != self.day:
             return
         strat.trades_today = s.get("trades_today", 0)
+        self.locked = s.get("locked", {})
         if s.get("position"):
             p = s["position"]
             c = p["contract"]
@@ -69,7 +72,7 @@ class StateFile:
             pos["contract"]["expiry"] = strat.position.contract.expiry.isoformat()
             pos["entry_time"] = strat.position.entry_time.isoformat()
         self.path.write_text(json.dumps({"day": self.day, "trades_today": strat.trades_today,
-                                         "position": pos}, indent=2))
+                                         "position": pos, "locked": self.locked}, indent=2))
 
 
 class CandleCache:
@@ -94,6 +97,23 @@ class CandleCache:
                 self.data[s] = [merged[k] for k in sorted(merged)]
 
 
+def _buy_alert(alert: Alerter, p) -> None:
+    lots = p.qty // p.contract.lot_size
+    alert.send("🟢 BUY NOW",
+               f"{contract_label(p.contract)}: {lots} lot(s), qty {p.qty}, around ₹{p.entry_price}. "
+               f"Stop ₹{p.stop}. Target ₹{p.target}.",
+               speak=f"Buy now. Nifty {p.contract.strike:.0f} {'call' if p.contract.opt_type == 'CE' else 'put'}.")
+
+
+def _sell_alert(alert: Alerter, trade) -> None:
+    why = {"TARGET": "target hit", "STOP_LOSS": "stop loss hit", "TRAIL_STOP": "trailing stop hit",
+           "RED_LINE": "line turned red", "TIME_3:15": "3:15 PM square-off"}.get(trade.exit_reason, trade.exit_reason)
+    alert.send("🔴 SELL NOW",
+               f"Sell ALL {trade.qty} qty {trade.symbol} ({why}), around ₹{trade.exit_price}. "
+               f"P&L ₹{trade.net_pnl:,.0f} after charges. Done for today.",
+               speak="Sell now.")
+
+
 def run_live(cfg: dict) -> None:
     today = datetime.now(IST).date()
     log = Journal(today)
@@ -116,6 +136,7 @@ def run_live(cfg: dict) -> None:
         log("Weekend. Market closed.")
         return
 
+    alert = Alerter(cfg, log)
     strat = Strategy(cfg, log=log)
     state = StateFile(today)
     state.load(strat)
@@ -127,6 +148,9 @@ def run_live(cfg: dict) -> None:
     step = cfg["trade"]["strike_step"]
     square_off = hhmm(cfg["timing"]["square_off"])
     last_minute_done = None
+    lock = cfg["trade"].get("strike_mode", "follow") == "lock"
+    alert.send("✅ Bot is running", f"Paper trading Nifty options today ({today}). "
+               f"I'll pick today's strike at {cfg['timing']['no_entry_before']} and tell you exactly when to buy and sell.")
 
     while True:
         now = datetime.now(IST)
@@ -140,11 +164,20 @@ def run_live(cfg: dict) -> None:
                 if ltp is not None:
                     reason = strat.check_price(ltp)
                     if reason:
-                        append_trade(strat.close(ltp, now, reason), "paper")
+                        t = strat.close(ltp, now, reason)
+                        append_trade(t, "paper")
+                        _sell_alert(alert, t)
                         state.save(strat)
+                    else:
+                        moved = strat.update_trail(ltp)
+                        if moved:
+                            alert.send("⬆️ Stop moved up", f"{p.contract.symbol}: {moved}")
+                            state.save(strat)
                 if strat.position and now.time() >= square_off:
                     ltp = ltp or p.entry_price
-                    append_trade(strat.close(ltp, now, "TIME_3:15"), "paper")
+                    t = strat.close(ltp, now, "TIME_3:15")
+                    append_trade(t, "paper")
+                    _sell_alert(alert, t)
                     state.save(strat)
 
             # ---- once per minute, 3 seconds after the candle closes ----
@@ -157,7 +190,9 @@ def run_live(cfg: dict) -> None:
                     cache.refresh([s], now)
                     if strat.red_line_exit(closed_upto(cache.data[s], close_ts)):
                         ltp = client.ltp([s]).get(s) or cache.data[s][-1]["c"]
-                        append_trade(strat.close(ltp, now, "RED_LINE"), "paper")
+                        t = strat.close(ltp, now, "RED_LINE")
+                        append_trade(t, "paper")
+                        _sell_alert(alert, t)
                         state.save(strat)
                 elif strat.can_enter(now):
                     cache.refresh([idx], now)
@@ -167,6 +202,14 @@ def run_live(cfg: dict) -> None:
                     else:
                         spot = index_c[-1]["c"]
                         ce_k, pe_k = itm_strikes(spot, step)
+                        if lock:
+                            if not state.locked:
+                                state.locked = {"CE": ce_k, "PE": pe_k}
+                                state.save(strat)
+                                alert.send("📌 Today's strike",
+                                           f"Nifty {spot:.2f}. Watching only {ce_k:.0f} CE and {pe_k:.0f} PE "
+                                           f"(expiry {expiry:%d %b}) for the rest of the day.")
+                            ce_k, pe_k = state.locked["CE"], state.locked["PE"]
                         picks = {t: pick(contracts, expiry, k, t) for t, k in (("CE", ce_k), ("PE", pe_k))}
                         picks = {t: c for t, c in picks.items() if c}
                         cache.refresh([c.scrip for c in picks.values()], now)
@@ -177,7 +220,8 @@ def run_live(cfg: dict) -> None:
                             contract, reason = sig
                             ltp = client.ltp([contract.scrip]).get(contract.scrip) \
                                 or options[contract.opt_type][1][-1]["c"]
-                            strat.open(contract, ltp, now, reason)
+                            if strat.open(contract, ltp, now, reason):
+                                _buy_alert(alert, strat.position)
                             state.save(strat)
                         elif minute.minute % 15 == 0:
                             log(f"Watching. Nifty {spot:.2f}, ITM CE {ce_k:.0f} / PE {pe_k:.0f}. No signal yet.")
@@ -189,9 +233,13 @@ def run_live(cfg: dict) -> None:
     if strat.position:  # safety net
         p = strat.position
         ltp = client.ltp([p.contract.scrip]).get(p.contract.scrip) or p.entry_price
-        append_trade(strat.close(ltp, datetime.now(IST), "TIME_3:15"), "paper")
+        t = strat.close(ltp, datetime.now(IST), "TIME_3:15")
+        append_trade(t, "paper")
+        _sell_alert(alert, t)
         state.save(strat)
-    if strat.trades_today == 0:
-        log("No clear signal today. No trade taken (your rule).")
     total = sum(t.net_pnl for t in strat.closed)
-    log(f"Day done. Trades: {len(strat.closed)}. Net P&L ₹{total:,.2f}. Log: {log.path}")
+    if strat.trades_today == 0:
+        alert.send("😴 No trade today", "No clear blue-line signal after 9:45, so no trade (your rule).")
+    else:
+        alert.send("🏁 Day done", f"Trades: {len(strat.closed)}. Net P&L ₹{total:,.0f} after charges.")
+    log(f"Log saved: {log.path}")
