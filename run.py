@@ -7,10 +7,12 @@
   python run.py replay 2026-11-19     replay a past day with the same rules
   python run.py backtest 2026-11-09 2026-11-20   replay every day in a date range, with a summary
                                       (expired weekly contracts are fetched too)
+  python run.py backtest 12months     the same, for the last 12 months (or 3months, 6months...)
   python run.py export 2026-11-20     save that day's Nifty 1-min candles to a CSV
   python run.py export 2026-11-20 25400 PE   same, for one option
   python run.py test-alert            send a test alert (Mac pop-up, voice, Telegram)
   python run.py debug                 print raw API answers to help fix data problems
+  python run.py debug-expired 2026-11-12   raw answers of the expired-contract calls for one past day
   python run.py demo                  run on a made-up day, no API needed
 """
 from __future__ import annotations
@@ -82,9 +84,15 @@ def _expired_chain(cfg: dict, client, day: date):
     from datetime import timedelta
     from bot.indstocks import expired_contracts, expired_expiries
     und = cfg["trade"]["underlying"]
-    if "expiries" not in _EXPIRED:
-        today = date.today()
-        _EXPIRED["expiries"] = expired_expiries(client, und, today - timedelta(days=364), today)
+    want_from = day - timedelta(days=7)
+    if "from" not in _EXPIRED or want_from < _EXPIRED["from"]:
+        upto = _EXPIRED.get("from", date.today() + timedelta(days=1)) - timedelta(days=1)
+        got = expired_expiries(client, und, want_from, upto)
+        _EXPIRED["expiries"] = sorted(set(_EXPIRED.get("expiries", [])) | set(got))
+        _EXPIRED["from"] = want_from
+        if not _EXPIRED["expiries"]:
+            raise RuntimeError("the expired-expiries API returned no Nifty expiries; run `python run.py "
+                               f"debug-expired {day}` and send the output to Claude")
     exp = next((e for e in _EXPIRED["expiries"] if e >= day), None)
     if exp is None or (exp - day).days > 10:
         return None, []
@@ -113,9 +121,9 @@ def replay_day(cfg: dict, client, contracts, day: date, log=print):
         try:
             old_exp, old_chain = _expired_chain(cfg, client, day)
         except Exception as e:  # noqa: BLE001
-            return [], f"couldn't load that day's expired contract ({e.__class__.__name__}: {str(e)[:150]})"
+            return [], f"skipped: couldn't load that day's expired contract ({e.__class__.__name__}: {str(e)[:200]})"
         if not old_chain:
-            return [], "skipped: couldn't find that day's expired weekly contract"
+            return [], (f"skipped: no expired contract list for that week (run: python run.py debug-expired {day})")
         expiry, chain, expired = old_exp, old_chain, True
     if cfg["trade"]["skip_expiry_day"] and day == expiry:
         return [], "expiry day, no trading"
@@ -124,9 +132,10 @@ def replay_day(cfg: dict, client, contracts, day: date, log=print):
     scrips = [c.scrip for c in needed]
     opt_c = expired_candles(client, scrips, start, end) if expired else client.candles(scrips, start, end)
     if not any(opt_c.values()):
-        return [], "skipped: no option candles came back for that day"
+        return [], ("skipped: no option candles came back for that day"
+                    + (f" (run: python run.py debug-expired {day})" if expired else ""))
     trades = simulate_day(cfg, day, index_c, opt_c, chain, expiry, log=log)
-    return trades, "traded" if trades else "no clear signal"
+    return trades, "traded" if trades else "no trade (no clean breakout)"
 
 
 def _client_and_contracts(cfg: dict):
@@ -149,39 +158,78 @@ def cmd_replay(cfg: dict, day: date) -> None:
         _print_trade(t)
 
 
+def summarize(rows: list[dict], notes: dict[str, int], cfg: dict) -> list[str]:
+    """Plain-English summary of a backtest: totals, win rate, worst run of losses, monthly P&L."""
+    out = []
+    total = sum(r["net_pnl"] for r in rows)
+    wins = [r["net_pnl"] for r in rows if r["net_pnl"] > 0]
+    losses = [r["net_pnl"] for r in rows if r["net_pnl"] <= 0]
+    days = sum(notes.values())
+    out.append(f"Weekdays checked: {days}. " + ", ".join(f"{k}: {v}" for k, v in sorted(notes.items(), key=lambda x: -x[1])))
+    out.append(f"Trades: {len(rows)}  Wins: {len(wins)}  Losses: {len(losses)}  "
+               f"Win rate: {100 * len(wins) / len(rows):.0f}%" if rows else "Trades: 0")
+    if not rows:
+        return out
+    out.append(f"Net P&L after charges: ₹{total:,.0f}   Average per trade: ₹{total / len(rows):,.0f}   "
+               f"Average per trading day checked: ₹{total / max(1, days):,.0f}")
+    if wins and losses:
+        out.append(f"Average win: ₹{sum(wins) / len(wins):,.0f}   Average loss: ₹{sum(losses) / len(losses):,.0f}")
+    peak = run = dd = 0.0
+    streak = worst_streak = 0
+    for r in rows:
+        run += r["net_pnl"]
+        peak = max(peak, run)
+        dd = min(dd, run - peak)
+        streak = streak + 1 if r["net_pnl"] <= 0 else 0
+        worst_streak = max(worst_streak, streak)
+    best = max(rows, key=lambda r: r["net_pnl"])
+    worst = min(rows, key=lambda r: r["net_pnl"])
+    out.append(f"Best trade: {best['date']} ₹{best['net_pnl']:,.0f}   Worst trade: {worst['date']} ₹{worst['net_pnl']:,.0f}")
+    out.append(f"Biggest drop from a high point (max drawdown): ₹{dd:,.0f}   Longest losing streak: {worst_streak} trades")
+    out.append(f"Return on ₹{cfg['capital']['total']:,} capital: {100 * total / cfg['capital']['total']:.1f}%")
+    months: dict[str, float] = {}
+    for r in rows:
+        months[r["date"][:7]] = months.get(r["date"][:7], 0.0) + r["net_pnl"]
+    out.append("By month: " + "  ".join(f"{m}: ₹{v:,.0f}" for m, v in sorted(months.items())))
+    reasons: dict[str, int] = {}
+    for r in rows:
+        reasons[r["exit_reason"]] = reasons.get(r["exit_reason"], 0) + 1
+    out.append("Exits: " + ", ".join(f"{k} {v}" for k, v in sorted(reasons.items(), key=lambda x: -x[1])))
+    return out
+
+
 def cmd_backtest(cfg: dict, first: date, last: date) -> None:
     import csv
     from dataclasses import asdict
     from datetime import timedelta
     client, contracts = _client_and_contracts(cfg)
-    rows, total, day = [], 0.0, first
-    print(f"Backtest {first} to {last} (same rules as live, paper fills with slippage and charges)")
+    rows, notes, day = [], {}, first
+    print(f"Backtest {first} to {last}: Opening Range Breakout, same rules as live, "
+          "paper fills with slippage and charges")
     print("-" * 70)
     while day <= last:
         if day.weekday() < 5:
-            trades, note = replay_day(cfg, client, contracts, day, log=lambda m: None)
-            print(f"{day} {day:%a}: {note}")
+            try:
+                trades, note = replay_day(cfg, client, contracts, day, log=lambda m: None)
+            except Exception as e:  # noqa: BLE001  keep going: one bad day shouldn't stop a long backtest
+                trades, note = [], f"skipped: error {e.__class__.__name__}: {str(e)[:150]}"
+            print(f"{day} {day:%a}: {note}", flush=True)
+            key = note.split(" (")[0].split(":")[0] if note.startswith(("skipped", "no market")) else note
+            notes[key] = notes.get(key, 0) + 1
             for t in trades:
                 _print_trade(t)
-                total += t.net_pnl
                 rows.append(asdict(t))
         day += timedelta(days=1)
     print("-" * 70)
-    wins = sum(1 for r in rows if r["net_pnl"] > 0)
-    print(f"Trades: {len(rows)}  Wins: {wins}  Losses: {len(rows) - wins}  "
-          f"Net P&L: ₹{total:,.2f} on ₹{cfg['capital']['max_invested']:,} deployed")
-    if rows:
-        best = max(rows, key=lambda r: r["net_pnl"])
-        worst = min(rows, key=lambda r: r["net_pnl"])
-        print(f"Best day: {best['date']} ₹{best['net_pnl']:,.0f}   Worst day: {worst['date']} ₹{worst['net_pnl']:,.0f}   "
-              f"Return on ₹{cfg['capital']['total']:,} capital: {100 * total / cfg['capital']['total']:.1f}%")
+    for line in summarize(rows, notes, cfg):
+        print(line)
     if rows:
         out = ROOT / "backtest.csv"
         with out.open("w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=list(rows[0]))
             w.writeheader()
             w.writerows(rows)
-        print(f"Saved to {out}")
+        print(f"Every trade saved to {out}")
 
 
 def cmd_debug(cfg: dict) -> None:
@@ -241,6 +289,51 @@ def cmd_debug(cfg: dict) -> None:
     show("expired expiries", "/market/instruments/expired/expiries",
          {"underlying": "NIFTY", "segment": "DERIVATIVE",
           "expiry_from": (d0 - timedelta(days=30)).isoformat(), "expiry_to": d0.isoformat()}, 500)
+    print("\nDone. Copy everything above and send it to Claude. It contains no token or account details.")
+
+
+def cmd_debug_expired(cfg: dict, day: date) -> None:
+    """Print the raw answers of the three expired-contract calls for one past day (no token or account data)."""
+    import json
+    from datetime import timedelta
+    from bot.indstocks import IndstocksClient, expired_candles, expired_contracts, expired_expiries
+    from bot.replay import day_window_ms
+    client = IndstocksClient.from_env(cfg["api"]["base_url"])
+    und = cfg["trade"]["underlying"]
+
+    def raw(path, params):
+        print(f"\n=== GET {path} {params}")
+        try:
+            body = client._get(path, params)
+            print(json.dumps(body)[:1500])
+            return body
+        except Exception as e:  # noqa: BLE001
+            print(f"failed: {e.__class__.__name__}: {str(e)[:300]}")
+            return None
+
+    raw("/market/instruments/expired/expiries", {"underlying": und, "segment": "DERIVATIVE",
+        "expiry_from": (day - timedelta(days=7)).isoformat(), "expiry_to": (day + timedelta(days=10)).isoformat()})
+    try:
+        exps = expired_expiries(client, und, day - timedelta(days=7), day + timedelta(days=10))
+    except Exception as e:  # noqa: BLE001
+        print(f"parse failed: {e}")
+        exps = []
+    print(f"\nParsed expiries: {exps}")
+    exp = next((e for e in exps if e >= day), None)
+    if not exp:
+        print("No expiry found on or after that day. Send this output to Claude.")
+        return
+    raw("/market/instruments/expired/contracts", {"underlying": und, "segment": "DERIVATIVE", "expiry": exp.isoformat()})
+    chain = expired_contracts(client, und, exp)
+    print(f"\nParsed {len(chain)} option contracts for expiry {exp}. First 3: {chain[:3]}")
+    if not chain:
+        return
+    start, end = day_window_ms(day, warmup_days=0)
+    sample = sorted(chain, key=lambda c: c.strike)[len(chain) // 2: len(chain) // 2 + 2]
+    raw("/market/historical/expired/1minute", {"trading-symbols": ",".join(c.symbol for c in sample),
+        "start_time": start, "end_time": end, "segment": "NFO"})
+    got = expired_candles(client, [c.scrip for c in sample], start, end)
+    print("\nParsed candles: " + ", ".join(f"{k}: {len(v)}" for k, v in got.items()))
     print("\nDone. Copy everything above and send it to Claude. It contains no token or account details.")
 
 
@@ -337,9 +430,9 @@ def cmd_test_alert(cfg: dict) -> None:
 
 
 def cmd_demo(cfg: dict) -> None:
-    from tests.fake_market import make_day
+    from tests.fake_market import make_day, orb_path
     from bot.replay import simulate_day
-    day, index_c, opt_c, contracts, expiry = make_day(seed=7)
+    day, index_c, opt_c, contracts, expiry = make_day(path=orb_path(up=True))
     print(f"Made-up market day {day} (not real prices):")
     simulate_day(cfg, day, index_c, opt_c, contracts, expiry)
 
@@ -361,8 +454,15 @@ def main(argv: list[str]) -> None:
         cmd_replay(cfg, date.fromisoformat(argv[2]))
     elif cmd == "backtest" and len(argv) > 3:
         cmd_backtest(cfg, date.fromisoformat(argv[2]), date.fromisoformat(argv[3]))
+    elif cmd == "backtest" and len(argv) > 2 and argv[2].endswith("months"):
+        from datetime import timedelta
+        months = int(argv[2].replace("months", ""))
+        end = date.today() - timedelta(days=1)
+        cmd_backtest(cfg, end - timedelta(days=round(months * 30.4)), end)
     elif cmd == "debug":
         cmd_debug(cfg)
+    elif cmd == "debug-expired" and len(argv) > 2:
+        cmd_debug_expired(cfg, date.fromisoformat(argv[2]))
     elif cmd == "export" and len(argv) > 2:
         cmd_export(cfg, date.fromisoformat(argv[2]), argv[3:5] if len(argv) > 4 else None)
     elif cmd == "live":

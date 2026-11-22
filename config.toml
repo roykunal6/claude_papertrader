@@ -6,44 +6,40 @@ total = 50000          # your total trading capital (for reporting only)
 max_invested = 30000   # the bot never spends more than this on one trade
 
 [timing]
-no_entry_before = "09:45"   # wait 30 minutes after the 09:15 open
-last_entry = "14:45"        # no new trades after this time
+no_entry_before = "09:45"   # nothing before the opening range (09:15-09:45) is complete
+last_entry = "13:30"        # no new trades after this: late breakouts have little time left to work
 square_off = "15:15"        # close any open trade at this time
 
 [trade]
 max_trades_per_day = 1
-target_pct = 15.0           # exit when the option is up 15%
-stop_loss_pct = 7.0         # exit when the option is down 7%
-exit_on_red_line = true     # cheat-sheet rule: exit if the 1-min line turns red and a candle closes below it
+max_loss_per_trade = 2500   # size the trade so that a stop-out loses about this much at most (₹)
+max_lots = 99               # hard cap on lots, whatever the money allows
+stop_loss_pct = 25.0        # safety net: exit if the OPTION itself falls 25% (normally the Nifty stop comes first)
 skip_expiry_day = true      # no trading on Nifty expiry days
-strike_step = 50
-# "single": at 09:45 pick ONE strike (the one nearest Nifty) and trade only its CE or PE all day.
-# "lock": at 09:45 pick the in-the-money CE strike and the in-the-money PE strike, keep both all day.
-# "follow": re-pick the in-the-money strikes every minute as Nifty moves.
-strike_mode = "single"                                     # Nifty strikes are 50 points apart
+strike_step = 50            # Nifty strikes are 50 points apart
+# "itm": buy the nearest in-the-money strike at the moment of entry (recommended).
+# "atm": buy the strike nearest Nifty.
+strike_mode = "itm"
 underlying = "NIFTY"
 
-[trail]
-# Conservative trailing stop: lets a winner keep running while the line stays blue.
-enabled = true
-breakeven_at_pct = 5     # once up 5%, the stop moves to your buy price (can't lose)
-trail_pct = 7            # then the stop follows 7% below the highest price reached
-target_mode = "trail"    # at +15%: "trail" = keep riding with a tighter stop, "exit" = sell right away
-tight_trail_pct = 4      # after +15%, the stop follows 4% below the high
+[orb]
+# Opening Range Breakout. Everything here is measured on the Nifty 50 index, in index points.
+range_end = "09:45"         # the opening range is the high and low from 09:15 to this time
+max_range_pct = 0.9         # skip the day if the range is wider than this (% of Nifty): wild open
+min_range_pct = 0.15        # skip the day if the range is narrower than this: dead market
+breakout_buffer_pts = 5     # a 5-min candle must close at least this far past the range
+use_ema_filter = true       # and on the right side of its 20-candle average (trend agrees)
+ema_length = 20
+stop_at = "mid"             # "mid": stop if Nifty closes back past the middle of the range. "opposite": other side.
+max_risk_pts = 90           # skip a breakout that is already this far from its stop (don't chase)
+target_r = 2.0              # book profit when Nifty has moved 2x the risk in our favour
+breakeven_r = 1.0           # after 1x the risk in our favour, the stop moves to the entry level
+delta_guess = 0.6           # how much an in-the-money option moves per Nifty point (for sizing only)
 
 [alerts]
 mac_popup = true         # pop-up with a sound on your Mac
 mac_voice = true         # your Mac says "Buy now" / "Sell now" out loud
 # Telegram: put TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env (see README)
-
-[indicator]
-# Look-alike of TrendIkaterr. "ema" or "hma" (Hull, faster). Length 11 matches "TRENDIKATERR 11".
-method = "ema"
-length = 11
-# The index's own trend must agree: CE only when Nifty's line is blue, PE only when it's red.
-require_index_agreement = true
-# "Establish a trend first": Nifty's line must have held that colour for at least this many 1-min candles.
-index_trend_min_candles = 5
 
 [live]
 # REAL MONEY. Leave this false until you've watched paper trading for a while.
