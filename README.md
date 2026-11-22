@@ -55,9 +55,11 @@ Start it before 09:45 and leave the window open until about 15:17. It prints and
 - `logs/YYYY-MM-DD.log` has everything it saw and did that day
 - `trades.csv` has one row per paper trade with entry, exit, reason and P&L after charges
 
-Other commands:
+Other commands (replay and backtest only cover days whose weekly option contract hasn't expired yet,
+because expired contracts aren't in INDstocks' instrument list):
 ```
-python run.py replay 2026-11-17   # replay a past day (days in the current expiry week)
+python run.py replay 2026-11-19                # replay one past day, printing every decision
+python run.py backtest 2026-11-16 2026-11-20   # replay a range of days, with a summary and backtest.csv
 python run.py demo                # made-up day, no internet or token needed
 python -m pytest -q               # run the rule tests
 ```
