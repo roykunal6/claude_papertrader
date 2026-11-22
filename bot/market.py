@@ -13,8 +13,17 @@ def load_contracts(client: IndstocksClient, cfg: dict, log=print) -> list[Contra
         return contracts
     prefix = cfg["api"].get("option_prefix", "auto")
     if prefix == "auto":
-        sample = contracts[0].scrip.split("_", 1)[1]
-        prefix = detect_option_prefix(client, sample)
+        # sample: nearest-expiry contracts closest to the current Nifty level (most likely to trade)
+        spot = None
+        try:
+            spot = client.ltp([cfg["api"]["index_scrip"]]).get(cfg["api"]["index_scrip"])
+        except Exception:  # noqa: BLE001
+            pass
+        first_exp = min(c.expiry for c in contracts)
+        near = [c for c in contracts if c.expiry == first_exp]
+        near.sort(key=lambda c: abs(c.strike - spot) if spot else 0)
+        sample = [c.scrip.split("_", 1)[1] for c in near[:5]]
+        prefix = detect_option_prefix(client, sample, log)
         log(f"Option codes use the {prefix}_ prefix.")
     if prefix != "NFO":
         contracts = [replace(c, scrip=f"{prefix}_{c.scrip.split('_', 1)[1]}") for c in contracts]

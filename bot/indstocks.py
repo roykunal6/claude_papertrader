@@ -96,16 +96,37 @@ class IndstocksClient:
         return out
 
 
-def detect_option_prefix(client: "IndstocksClient", security_id: str) -> str:
-    """Options may be quoted as NFO_<id> or NSE_<id>; try both and keep the one that answers."""
-    for prefix in ("NFO", "NSE"):
-        code = f"{prefix}_{security_id}"
+def detect_option_prefix(client: "IndstocksClient", security_ids: list[str], log=print) -> str:
+    """Work out whether option codes are NSE_<id> or NFO_<id>.
+
+    Tries 1-min candles from the last 7 days (works on weekends too), then live quotes.
+    A prefix INDstocks rejects outright (HTTP 400) is wrong; one it accepts but has no data
+    for is the right format for a quiet contract.
+    """
+    end = int(time.time() * 1000)
+    start = end - 7 * 86400 * 1000
+    accepted = []
+    for prefix in ("NSE", "NFO"):
+        codes = [f"{prefix}_{sid}" for sid in security_ids[:5]]
         try:
-            if client.ltp([code]).get(code) is not None:
+            got = client.candles(codes, start, end)
+        except ApiError as e:
+            log(f"  {prefix}_ rejected for candles: {str(e)[:120]}")
+            continue
+        if any(got.get(c) for c in codes):
+            return prefix
+        accepted.append(prefix)
+        try:
+            q = client.ltp(codes)
+            if any(v is not None for v in q.values()):
                 return prefix
         except ApiError:
             pass
-    raise ApiError(f"Couldn't get a quote for option {security_id} as NFO_ or NSE_. Last errors: {client.last_errors}")
+    if accepted:
+        log(f"  No option data yet (market closed?). Using {accepted[0]}_, which INDstocks accepts.")
+        return accepted[0]
+    log("  Couldn't confirm the option code format. Falling back to NSE_.")
+    return "NSE"
 
 
 def generate_token_from_totp(base_url: str) -> str:

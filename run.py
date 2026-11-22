@@ -216,7 +216,10 @@ def main(argv: list[str]) -> None:
     cfg = load_config()
     cmd = argv[1] if len(argv) > 1 else "help"
     if cmd == "check":
-        cmd_check(cfg)
+        try:
+            cmd_check(cfg)
+        except Exception as e:  # noqa: BLE001
+            print(f"\nCheck stopped: {e.__class__.__name__}: {e}\nSend this to Claude.")
     elif cmd == "paper":
         from bot.live import run_live
         run_live(cfg)
