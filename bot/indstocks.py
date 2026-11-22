@@ -135,27 +135,63 @@ class IndstocksClient:
 def _rows(body) -> list:
     """Pull the list out of {"status": "success", "data": [...]} or similar shapes."""
     data = body.get("data", body) if isinstance(body, dict) else body
-    if isinstance(data, dict):
-        for k in ("expiries", "contracts", "items", "results", "data"):
-            if isinstance(data.get(k), list):
-                return data[k]
+    for _ in range(3):  # allow {"data": {"data": [...]}} and {"data": {"contracts": [...]}}
+        if isinstance(data, dict):
+            for k in ("expiries", "contracts", "instruments", "items", "results", "data"):
+                if isinstance(data.get(k), (list, dict)):
+                    data = data[k]
+                    break
+            else:
+                break
     return data if isinstance(data, list) else []
 
 
+def _field(row: dict, *names):
+    for n in names:
+        for k in (n, n.upper(), n.lower()):
+            if row.get(k) not in (None, ""):
+                return row[k]
+    raise KeyError(names[0])
+
+
+def _candle(c) -> dict:
+    """One candle from a dict {"ts","o","h","l","c","v"} or a list [ts, o, h, l, c, v]."""
+    if isinstance(c, dict):
+        ts, o, h, lo, cl = (c.get("ts", c.get("timestamp", c.get("time"))), c.get("o", c.get("open")),
+                            c.get("h", c.get("high")), c.get("l", c.get("low")), c.get("c", c.get("close")))
+        v = c.get("v", c.get("volume")) or 0
+    else:
+        ts, o, h, lo, cl = c[:5]
+        v = c[5] if len(c) > 5 else 0
+    ts = int(float(ts))
+    if ts > 10**12:  # milliseconds
+        ts //= 1000
+    return {"ts": ts, "o": float(o), "h": float(h), "l": float(lo), "c": float(cl), "v": float(v or 0)}
+
+
 def expired_expiries(client: "IndstocksClient", underlying: str, start, end) -> list:
-    """Past expiry dates (as date objects) between start and end (dates, span <= 1 year)."""
+    """Past expiry dates (as date objects) between start and end (dates). Asks in 90-day pieces,
+    in case the API limits how wide one request can be."""
+    from datetime import timedelta
     from .instruments import parse_date
-    body = client._get("/market/instruments/expired/expiries", {
-        "underlying": underlying, "segment": "DERIVATIVE",
-        "expiry_from": start.isoformat(), "expiry_to": end.isoformat()})
-    out = []
-    for v in _rows(body):
-        v = v.get("expiry") if isinstance(v, dict) else v
-        try:
-            out.append(parse_date(str(v)[:10]))
-        except ValueError:
-            pass
-    return sorted(set(out))
+    out, a = set(), start
+    while a <= end:
+        b = min(end, a + timedelta(days=89))
+        body = client._get("/market/instruments/expired/expiries", {
+            "underlying": underlying, "segment": "DERIVATIVE",
+            "expiry_from": a.isoformat(), "expiry_to": b.isoformat()})
+        for v in _rows(body):
+            if isinstance(v, dict):
+                v = next((v[k] for k in ("expiry", "expiry_date", "date", "EXPIRY_DATE") if v.get(k)), "")
+            try:
+                out.add(parse_date(str(v)[:10]))
+            except ValueError:
+                try:
+                    out.add(parse_date(str(v)))
+                except ValueError:
+                    pass
+        a = b + timedelta(days=1)
+    return sorted(out)
 
 
 def expired_contracts(client: "IndstocksClient", underlying: str, expiry) -> list:
@@ -166,13 +202,20 @@ def expired_contracts(client: "IndstocksClient", underlying: str, expiry) -> lis
         "underlying": underlying, "segment": "DERIVATIVE", "expiry": expiry.isoformat()})
     out = []
     for r in _rows(body):
+        if not isinstance(r, dict):
+            continue
         try:
-            if str(r.get("instrument_type", "OPTIDX")).upper() != "OPTIDX":
+            kind = str(r.get("instrument_type") or r.get("INSTRUMENT_NAME") or "OPTIDX").upper()
+            if kind not in ("OPTIDX", "OPTION", "OPT", "OPTIONS"):
                 continue
-            sym = r["trading_symbol"]
-            out.append(Contract(scrip=f"EXP:{sym}", symbol=sym, strike=float(r["strike_price"]),
-                                opt_type=str(r["option_type"]).upper(), expiry=expiry,
-                                lot_size=int(float(r.get("lot_size") or 65))))
+            opt = str(_field(r, "option_type", "opt_type", "OPTION_TYPE")).upper()
+            if opt not in ("CE", "PE"):
+                continue
+            sym = str(_field(r, "trading_symbol", "tradingSymbol", "symbol", "TRADING_SYMBOL"))
+            strike = float(_field(r, "strike_price", "strike", "STRIKE_PRICE"))
+            lot = r.get("lot_size") or r.get("LOT_UNITS") or r.get("lotSize") or 65
+            out.append(Contract(scrip=f"EXP:{sym}", symbol=sym, strike=strike, opt_type=opt,
+                                expiry=expiry, lot_size=int(float(lot))))
         except (KeyError, TypeError, ValueError):
             continue
     return out
@@ -187,11 +230,16 @@ def expired_candles(client: "IndstocksClient", scrips: list, start_ms: int, end_
         body = client._get(f"/market/historical/expired/{interval}", {
             "trading-symbols": ",".join(syms[i:i + 50]), "start_time": start_ms, "end_time": end_ms,
             "segment": "NFO"})
-        for sym, v in (body.get("data") or {}).items():
-            rows = (v or {}).get("candles") or [] if isinstance(v, dict) else v or []
-            out[f"EXP:{sym}"] = [{"ts": int(c["ts"]), "o": float(c["o"]), "h": float(c["h"]),
-                                  "l": float(c["l"]), "c": float(c["c"]), "v": float(c.get("v") or 0)}
-                                 for c in rows]
+        data = body.get("data") if isinstance(body, dict) else None
+        items = data.items() if isinstance(data, dict) else []
+        if isinstance(data, list):  # [{"trading_symbol": ..., "candles": [...]}, ...]
+            items = [(d.get("trading_symbol") or d.get("symbol"), d) for d in data if isinstance(d, dict)]
+        for sym, v in items:
+            rows = (v.get("candles") or []) if isinstance(v, dict) else (v or [])
+            try:
+                out[f"EXP:{sym}"] = sorted((_candle(c) for c in rows), key=lambda c: c["ts"])
+            except (TypeError, ValueError, IndexError, KeyError):
+                continue
     return out
 
 

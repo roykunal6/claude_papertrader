@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 
-from .instruments import Contract, itm_strikes, pick, strikes_for
+from .instruments import Contract, itm_strikes, pick, pick_strike
 from .strategy import IST, Strategy, Trade, hhmm
 
 
@@ -15,7 +15,7 @@ def closed_upto(candles: list[dict], close_ts: int) -> list[dict]:
 def simulate_day(cfg: dict, day: date, index_candles: list[dict],
                  option_candles: dict[str, list[dict]], contracts: list[Contract],
                  expiry: date, log=print) -> list[Trade]:
-    """index_candles / option_candles may include earlier days (used to warm up the indicator)."""
+    """index_candles may include earlier days (used to warm up the 20-candle average)."""
     strat = Strategy(cfg, log=log)
     if cfg["trade"]["skip_expiry_day"] and day == expiry:
         log(f"{day} is a Nifty expiry day. No trading.")
@@ -28,7 +28,6 @@ def simulate_day(cfg: dict, day: date, index_candles: list[dict],
         log(f"No Nifty candles for {day} (holiday or no data).")
         return []
 
-    locked: dict[str, float] = {}
     for bar in today:
         close_ts = bar["ts"] + 60
         now = datetime.fromtimestamp(close_ts, IST)
@@ -37,18 +36,13 @@ def simulate_day(cfg: dict, day: date, index_candles: list[dict],
             p = strat.position
             held = option_candles.get(p.contract.scrip, [])
             this = next((c for c in held if c["ts"] == bar["ts"]), None)
-            if this:
-                reason = strat.check_price(this["l"])   # cautious: assume the low came first
-                if reason in ("STOP_LOSS", "TRAIL_STOP"):
-                    strat.close(min(p.stop, this["o"]), now, reason, exact=True)
-                elif strat.check_price(this["h"]) == "TARGET":
-                    strat.close(max(p.target, this["o"]), now, "TARGET", exact=True)
-                else:
-                    msg = strat.update_trail(this["h"])
-                    if msg:
-                        log(f"{now:%H:%M} {msg}")
-                    if strat.red_line_exit(closed_upto(held, close_ts)):
-                        strat.close(this["c"], now, "RED_LINE")
+            if this and strat.check_price(this["l"]):   # cautious: assume the option's low came first
+                strat.close(min(p.stop, this["o"]), now, "OPTION_STOP", exact=True)
+            else:
+                why = strat.index_exit(bar)
+                if why:
+                    last = closed_upto(held, close_ts)
+                    strat.close(this["c"] if this else (last[-1]["c"] if last else p.entry_price), now, why)
             if strat.position and now.time() >= square_off:
                 last = closed_upto(held, close_ts)
                 strat.close(last[-1]["c"] if last else p.entry_price, now, "TIME_3:15")
@@ -56,27 +50,20 @@ def simulate_day(cfg: dict, day: date, index_candles: list[dict],
 
         if now.time() >= square_off:
             break
-        if not strat.can_enter(now):
+        setup = strat.entry_signal(now, closed_upto(index_candles, close_ts))
+        if not setup:
             continue
-        mode = cfg["trade"].get("strike_mode", "follow")
-        ce_k, pe_k = strikes_for(bar["c"], step, mode)
-        if mode in ("lock", "single"):
-            if not locked:
-                locked.update(CE=ce_k, PE=pe_k)
-                log(f"{now:%H:%M} Strike locked for the day: {ce_k:.0f} CE / {pe_k:.0f} PE (Nifty {bar['c']:.2f})")
-            ce_k, pe_k = locked["CE"], locked["PE"]
-        options = {}
-        for opt_type, k in (("CE", ce_k), ("PE", pe_k)):
-            c = pick(contracts, expiry, k, opt_type)
-            if c and c.scrip in option_candles:
-                options[opt_type] = (c, closed_upto(option_candles[c.scrip], close_ts))
-        sig = strat.entry_signal(now, closed_upto(index_candles, close_ts), options)
-        if sig:
-            contract, reason = sig
-            strat.open(contract, options[contract.opt_type][1][-1]["c"], now, reason)
+        k = pick_strike(setup.spot, setup.opt_type, step, cfg["trade"].get("strike_mode", "itm"))
+        c = pick(contracts, expiry, k, setup.opt_type)
+        bars = closed_upto(option_candles.get(c.scrip, []), close_ts) if c else []
+        if not bars or bars[-1]["ts"] < bar["ts"] - 300:
+            strat.trades_today += 1
+            log(f"{now:%H:%M} Signal for {k:.0f} {setup.opt_type} but no recent price for it in the data. Skipped.")
+            continue
+        strat.open(c, bars[-1]["c"], now, setup)
 
     if strat.trades_today == 0:
-        log(f"{day}: no clear signal after {cfg['timing']['no_entry_before']}. No trade.")
+        log(f"{day}: no clean breakout after {cfg['timing']['no_entry_before']}. No trade.")
     return strat.closed
 
 

@@ -10,11 +10,10 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from bot.costs import order_charges  # noqa: E402
-from bot.indicator import BLUE, RED, trend_line  # noqa: E402
 from bot.instruments import itm_strikes, load_nifty_options  # noqa: E402
 from bot.replay import simulate_day  # noqa: E402
 from bot.strategy import IST, Strategy  # noqa: E402
-from tests.fake_market import make_day  # noqa: E402
+from tests.fake_market import make_day, orb_path  # noqa: E402
 
 
 def cfg():
@@ -22,25 +21,114 @@ def cfg():
         return tomllib.load(f)
 
 
-def test_trend_line_flips():
-    closes = [100 - i for i in range(30)] + [70 + 2 * i for i in range(30)]
-    pts = trend_line(closes, 11)
-    assert pts[25].colour == RED
-    assert pts[-1].colour == BLUE
-    buys = [i for i, p in enumerate(pts) if p.signal == "BUY"]
-    assert len(buys) == 1 and buys[0] > 30
-
-
 def test_itm_strikes():
     assert itm_strikes(25227.95, 50) == (25200.0, 25250.0)
     assert itm_strikes(25200.0, 50) == (25150.0, 25250.0)  # exactly at a strike is not ITM
 
 
-def test_size_fits_in_30k():
+def quiet(c=None):
+    return lambda m: None
+
+
+# ---------------- Opening Range Breakout ----------------
+def test_breakout_up_buys_itm_call_and_books_target():
+    day, idx, opt, contracts, expiry = make_day(path=orb_path(up=True))
+    logs = []
+    trades = simulate_day(cfg(), day, idx, opt, contracts, expiry, log=logs.append)
+    assert len(trades) == 1, logs
+    t = trades[0]
+    assert t.opt_type == "CE" and t.entry_time >= "09:45" and t.exit_reason == "TARGET"
+    assert t.strike < 25230  # in the money at entry
+    assert t.net_pnl > 0
+
+
+def test_breakout_down_buys_put():
+    day, idx, opt, contracts, expiry = make_day(path=orb_path(up=False))
+    trades = simulate_day(cfg(), day, idx, opt, contracts, expiry, log=quiet())
+    assert len(trades) == 1 and trades[0].opt_type == "PE" and trades[0].exit_reason == "TARGET"
+
+
+def test_failed_breakout_stops_out_small():
+    day, idx, opt, contracts, expiry = make_day(path=orb_path(up=True, fail=True))
+    trades = simulate_day(cfg(), day, idx, opt, contracts, expiry, log=quiet())
+    assert len(trades) == 1
+    t = trades[0]
+    assert t.exit_reason in ("STOP_LOSS", "OPTION_STOP") and t.net_pnl < 0
+    assert t.net_pnl > -cfg()["trade"]["max_loss_per_trade"] * 1.3
+
+
+def test_one_trade_a_day_even_after_a_stop():
+    path = orb_path(up=True, fail=True)
+    path += [path[-1] - 2 * i for i in range(375 - len(path))]  # later breakdown: still no second trade
+    day, idx, opt, contracts, expiry = make_day(path=path[:375])
+    assert len(simulate_day(cfg(), day, idx, opt, contracts, expiry, log=quiet())) == 1
+
+
+def test_flat_day_no_trade():
+    flat = [25200.0 + (0.5 if i % 2 else -0.5) for i in range(375)]
+    day, idx, opt, contracts, expiry = make_day(path=flat)
+    logs = []
+    assert simulate_day(cfg(), day, idx, opt, contracts, expiry, log=logs.append) == []
+    assert any("Too quiet" in m for m in logs)
+
+
+def test_wild_open_skipped():
+    wild = [25200.0 + (150 if (i // 5) % 2 else -150) for i in range(30)] + [25600.0 + i for i in range(345)]
+    day, idx, opt, contracts, expiry = make_day(path=wild)
+    logs = []
+    assert simulate_day(cfg(), day, idx, opt, contracts, expiry, log=logs.append) == []
+    assert any("Too wild" in m for m in logs)
+
+
+def test_breakout_against_the_average_is_not_taken():
+    from bot.orb import find_setup
+    day, idx, *_ = make_day(path=orb_path(up=True))
+    # yesterday Nifty was 400 points lower: the 20-candle average is still far below today's price,
+    # so a break DOWN through the range goes against the trend and must be refused
+    prev = [dict(c, ts=c["ts"] - 86400, o=c["o"] - 400, h=c["h"] - 400, l=c["l"] - 400, c=c["c"] - 400)
+            for c in make_day(path=orb_path(up=False))[1]]
+    down = make_day(path=orb_path(up=False))[1]
+    seen, notes = set(), []
+    for i in range(30, 120):
+        now = datetime.fromtimestamp(down[i]["ts"] + 60, IST)
+        setup, note = find_setup(cfg(), prev + down[: i + 1], now, seen)
+        assert setup is None
+        if note:
+            notes.append(note)
+    assert any("wrong side" in n for n in notes)
+
+
+def test_stop_moves_to_entry_after_1r():
+    from bot.orb import Setup
+    s = Strategy(cfg(), log=quiet())
+    day, idx, opt, contracts, expiry = make_day(path=orb_path(up=True))
+    now = datetime(2026, 11, 19, 10, 0, tzinfo=IST)
+    setup = Setup("CE", 25250.0, 25210.0, 25330.0, 40.0, "test")
+    p = s.open(contracts[0], 100.0, now, setup)
+    bar = {"o": 25255, "h": 25291, "l": 25250, "c": 25285}
+    assert s.index_exit(bar) is None and p.spot_stop == 25250.0
+    assert s.index_exit({"o": 25260, "h": 25262, "l": 25245, "c": 25249}) == "BREAKEVEN_STOP"
+    assert s.index_exit({"o": 25300, "h": 25331, "l": 25290, "c": 25320}) == "TARGET"
+    assert s.check_price(p.stop) == "OPTION_STOP"
+    assert not s.can_enter(now)  # one trade a day
+
+
+def test_size_respects_budget_and_max_loss():
     s = Strategy(cfg())
-    assert s.size(150.0, 65) == 195          # 3 lots = ₹29,250
-    assert s.size(175.0, 65) == 130          # 2 lots = ₹22,750
-    assert s.size(500.0, 65) == 0            # one lot = ₹32,500 > ₹30,000
+    assert s.size(150.0, 65) == 195                # no risk given: 3 lots = ₹29,250 fit in ₹30k
+    assert s.size(500.0, 65) == 0                  # one lot = ₹32,500 > ₹30,000
+    # 40 Nifty points of risk x 0.6 delta = ₹24/unit, ₹1,560 a lot (+slippage): 1 lot under ₹2,500
+    assert s.size(150.0, 65, risk_pts=40) == 65
+    assert s.size(300.0, 65, risk_pts=90) == 0     # 90 x 0.6 = ₹54/unit, ₹3,500+ a lot: over ₹2,500, no trade
+
+
+def test_five_minute_candles_align_to_open():
+    from bot.orb import five_minute
+    day, idx, *_ = make_day(path=orb_path(up=True))
+    bars = five_minute(idx[:12])          # 09:15..09:26: two full 5-min bars, the third isn't finished
+    assert len(bars) == 2
+    assert bars[0]["o"] == idx[0]["o"] and bars[0]["c"] == idx[4]["c"]
+    assert bars[1]["h"] == max(c["h"] for c in idx[5:10])
 
 
 def test_charges_reasonable():
@@ -49,55 +137,11 @@ def test_charges_reasonable():
     assert 10 < buy < 30 and 35 < sell < 60
 
 
-def test_no_entry_before_945_and_one_trade_only():
-    day, idx, opt, contracts, expiry = make_day(seed=7)
-    logs = []
-    trades = simulate_day(cfg(), day, idx, opt, contracts, expiry, log=logs.append)
-    assert len(trades) <= 1
-    for t in trades:
-        assert t.entry_time >= "09:45"
-        assert t.exit_time <= "15:16"
-        assert t.qty * t.entry_price <= 30000
-        assert t.exit_reason in {"TARGET", "STOP_LOSS", "TRAIL_STOP", "RED_LINE", "TIME_3:15"}
-
-
-def test_direction_follows_nifty():
-    # morning sell-off: should buy a PUT; steady rally from the open: should buy a CALL
-    down = [25300.0 - 1.5 * i for i in range(375)]
-    up = [25000.0 + 1.5 * i for i in range(375)]
-    for path, want in ((down, "PE"), (up, "CE")):
-        day, idx, opt, contracts, expiry = make_day(path=path)
-        trades = simulate_day(cfg(), day, idx, opt, contracts, expiry, log=lambda m: None)
-        assert all(t.opt_type == want for t in trades)
-
-
 def test_expiry_day_skipped():
     day, idx, opt, contracts, expiry = make_day(seed=7)
     logs = []
     assert simulate_day(cfg(), day, idx, opt, contracts, day, log=logs.append) == []
     assert "expiry" in logs[0]
-
-
-def test_flat_day_no_trade():
-    flat = [25200.0 + (0.5 if i % 2 else -0.5) for i in range(375)]
-    day, idx, opt, contracts, expiry = make_day(path=flat)
-    assert simulate_day(cfg(), day, idx, opt, contracts, expiry, log=lambda m: None) == []
-
-
-def test_target_and_stop_levels():
-    c = cfg()
-    day, idx, opt, contracts, expiry = make_day(seed=7)
-    s = Strategy(c, log=lambda m: None)
-    now = datetime(2026, 11, 19, 10, 0, tzinfo=IST)
-    p = s.open(contracts[0], 100.0, now, "test")
-    assert abs(p.target - p.entry_price * 1.15) < 0.03
-    assert abs(p.stop - p.entry_price * 0.93) < 0.03
-    assert s.check_price(p.target) is None          # trail mode: keep riding past +15%
-    s.cfg = {**c, "trail": {**c["trail"], "target_mode": "exit"}}
-    assert s.check_price(p.target) == "TARGET"
-    assert s.check_price(p.stop) == "STOP_LOSS"
-    assert s.check_price(p.entry_price) is None
-    assert not s.can_enter(now)  # one trade a day
 
 
 def test_instrument_csv_parsing():
@@ -130,54 +174,7 @@ def test_real_indstocks_csv_rows():
     assert c.expiry == date(2026, 12, 1) and c.strike == 27950 and c.lot_size == 65 and c.opt_type == "CE"
 
 
-def test_trailing_stop_only_moves_up():
-    c = cfg()
-    day, idx, opt, contracts, expiry = make_day(seed=7)
-    s = Strategy(c, log=lambda m: None)
-    now = datetime(2026, 11, 19, 10, 0, tzinfo=IST)
-    p = s.open(contracts[0], 100.0, now, "test")
-    entry = p.entry_price
-    assert s.update_trail(entry * 1.03) is None               # +3%: stop unchanged
-    assert s.update_trail(entry * 1.06) is not None           # +6%: stop to breakeven or better
-    assert p.stop >= entry
-    s.update_trail(entry * 1.12)                              # +12%: stop 7% under the high
-    assert abs(p.stop - entry * 1.12 * 0.93) < 0.1
-    before = p.stop
-    s.update_trail(entry * 1.01)                              # price falls back: stop stays
-    assert p.stop == before
-    assert s.check_price(before - 0.05) == "TRAIL_STOP"
-    s.update_trail(entry * 1.20)                              # past +15%: tighter 4% gap
-    assert abs(p.stop - entry * 1.20 * 0.96) < 0.1
-
-
-def test_strike_locked_for_the_day():
-    up = [25000.0 + 1.5 * i for i in range(375)]           # Nifty climbs 560 points
-    day, idx, opt, contracts, expiry = make_day(path=up)
-    logs = []
-    trades = simulate_day(cfg(), day, idx, opt, contracts, expiry, log=logs.append)
-    locked = [m for m in logs if "locked" in m]
-    assert len(locked) == 1
-    for t in trades:
-        assert f"{t.strike:.0f} {t.opt_type}" in locked[0]
-
-
 # ---------------- one strike for CE and PE ----------------
-def test_single_strike_mode_uses_one_strike_for_both():
-    from bot.instruments import strikes_for
-    assert strikes_for(25812.0, 50, "single") == (25800.0, 25800.0)
-    assert strikes_for(25830.0, 50, "single") == (25850.0, 25850.0)
-    assert strikes_for(25812.0, 50, "lock") == (25800.0, 25850.0)
-    c = cfg()
-    c["trade"]["strike_mode"] = "single"
-    day, idx, opt, contracts, expiry = make_day(seed=7)
-    logs = []
-    simulate_day(c, day, idx, opt, contracts, expiry, log=logs.append)
-    locked = [m for m in logs if "locked for the day" in m]
-    assert len(locked) == 1
-    ce, pe = locked[0].split(": ")[1].split(" (")[0].replace(" CE", "").replace(" PE", "").split(" / ")
-    assert ce == pe
-
-
 # ---------------- real-order broker, against a fake account ----------------
 class FakeAccount:
     """Pretends to be INDstocks. fill_ratio: share of each order that fills."""
@@ -245,7 +242,7 @@ def test_paper_command_never_creates_a_broker():
 # ---------------- backtest on an expired weekly ----------------
 def test_backtest_uses_expired_contract_api_for_old_weeks():
     import run as R
-    day, idx, opt, contracts, expiry = make_day(seed=7)   # 2026-11-19, weekly expiring later
+    day, idx, opt, contracts, expiry = make_day(path=orb_path(up=True))   # 2026-11-19, weekly expiring later
     old = {c.scrip: c for c in contracts}
     sym = {c.scrip: f"NIFTY{c.strike:.0f}{c.opt_type}" for c in contracts}
 
@@ -271,5 +268,5 @@ def test_backtest_uses_expired_contract_api_for_old_weeks():
     c = cfg()
     c["trade"]["underlying"] = "NIFTY"
     trades, note = R.replay_day(c, Client(), [], day, log=lambda m: None)   # no live contracts at all
-    assert note == "traded" and len(trades) == 1
+    assert note == "traded" and len(trades) == 1, note
     assert any("historical/expired" in p for p in Client.calls)

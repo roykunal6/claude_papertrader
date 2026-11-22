@@ -102,6 +102,15 @@ def strikes_for(spot: float, step: int, mode: str) -> tuple[float, float]:
     return itm_strikes(spot, step)
 
 
+def pick_strike(spot: float, opt_type: str, step: int, mode: str = "itm") -> float:
+    """Strike to buy at the moment of entry. "itm": nearest in-the-money (a bit more expensive, moves
+    more like Nifty and loses less to time decay). "atm": the strike nearest Nifty."""
+    if mode == "atm":
+        return day_strike(spot, step)
+    ce, pe = itm_strikes(spot, step)
+    return ce if opt_type == "CE" else pe
+
+
 def pick(contracts: list[Contract], expiry: date, strike: float, opt_type: str) -> Contract | None:
     for c in contracts:
         if c.expiry == expiry and c.opt_type == opt_type and abs(c.strike - strike) < 0.01:

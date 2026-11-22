@@ -6,7 +6,7 @@ import random
 from datetime import date, datetime, timedelta
 
 from bot.instruments import Contract
-from bot.strategy import IST
+from bot.orb import IST
 
 STEP = 50
 LOT = 65
@@ -51,3 +51,17 @@ def make_day(seed: int = 1, path: list[float] | None = None, day: date = date(20
             closes = [option_price(s, k, t, 375 - i + 5 * 375) for i, s in enumerate(path)]
             opt_c[c.scrip] = _bars(day, closes)
     return day, index_c, opt_c, contracts, expiry
+
+
+def orb_path(up: bool = True, fail: bool = False, base: float = 25200.0) -> list[float]:
+    """A made-up day: 30 minutes swinging inside a 60-point range, then a breakout.
+    fail=True: the breakout pops out of the range, then falls back through the middle."""
+    sign = 1 if up else -1
+    path = [base + 30 * math.sin(i / 2.5) for i in range(30)]          # 09:15-09:44: range ~base±30
+    if fail:
+        path += [base + sign * (2 + 3 * i) for i in range(15)]         # out of the range by ~10:00
+        path += [path[-1] - sign * 4 * i for i in range(1, 30)]        # and straight back down through it
+        path += [path[-1]] * (375 - len(path))
+    else:
+        path += [base + sign * 1.5 * i for i in range(345)]            # steady trend for the rest of the day
+    return path

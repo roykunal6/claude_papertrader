@@ -1,32 +1,27 @@
 """The trading rules, kept separate from data fetching so they can be tested and replayed.
 
-Kunal's rules:
-  * Nifty options only, nearest in-the-money strike, nearest weekly expiry
-  * No trading on expiry day
-  * No entry before 09:45; one trade per day; skip the day if there's no signal
-  * Enter the moment the option's 1-min trend line flips to BLUE (BUY) with the
-    candle closing above the line, and Nifty's own line agrees
-    (blue for a CE, red for a PE)
-  * Size: as many lots as fit inside max_invested (₹30,000)
-  * Exit at +15% target, at the stop loss, on the red-line rule, or at 15:15
+Strategy: Opening Range Breakout on Nifty (see bot/orb.py for the plain-English version).
+  * Nifty options only, in-the-money strike at the moment of entry, nearest weekly expiry
+  * No trading on expiry day; one trade per day; skip the day if there's no clean breakout
+  * Entry and exits are decided on the Nifty index's own chart, not the option's
+  * Size: 1+ lots, never more than max_invested (₹30,000) and never more than max_loss_per_trade at risk
+  * Exit at the Nifty target, the Nifty stop, the option's safety stop, or at 15:15
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from datetime import datetime, time
-from zoneinfo import ZoneInfo
+from datetime import datetime
 
 from .costs import order_charges
-from .indicator import BLUE, RED, trend_line
 from .instruments import Contract
+from .orb import IST, Setup, find_setup, hhmm, spot_exit
 
-IST = ZoneInfo("Asia/Kolkata")
+__all__ = ["IST", "Position", "Strategy", "Trade", "hhmm"]
 
 
-def hhmm(text: str) -> time:
-    h, m = text.split(":")
-    return time(int(h), int(m))
+def tick(price: float) -> float:
+    return round(round(price / 0.05) * 0.05, 2)  # option tick size ₹0.05
 
 
 @dataclass
@@ -35,13 +30,18 @@ class Position:
     qty: int
     entry_price: float
     entry_time: datetime
-    target: float
-    stop: float
+    target: float               # rough option price at the Nifty target (for the alert only)
+    stop: float                 # option safety stop (exits if the option itself falls this far)
     entry_charges: float
     reason: str
     pending_exit: str | None = None  # live mode: an exit that hasn't fully filled yet
-    peak: float = 0.0           # highest price since entry (for the trailing stop)
+    peak: float = 0.0           # highest option price since entry
     initial_stop: float = 0.0
+    spot_entry: float = 0.0     # Nifty level at entry
+    spot_stop: float = 0.0      # Nifty level that ends the trade
+    spot_target: float = 0.0    # Nifty level that books the profit
+    risk_pts: float = 0.0
+    spot_stop_moved: bool = False
 
 
 @dataclass
@@ -69,22 +69,33 @@ class Strategy:
     trades_today: int = 0
     position: Position | None = None
     closed: list[Trade] = field(default_factory=list)
+    _notes: set = field(default_factory=set)
+    _seen_bars: set = field(default_factory=set)
 
-    # ---------------- helpers ----------------
-    def _t(self, key: str) -> time:
+    def _t(self, key: str):
         return hhmm(self.cfg["timing"][key])
 
-    def _points(self, candles: list[dict]):
-        ind = self.cfg["indicator"]
-        return trend_line([c["c"] for c in candles], ind["length"], ind["method"])
+    def note(self, msg: str) -> None:
+        """Log a skip reason once per day."""
+        if msg not in self._notes:
+            self._notes.add(msg)
+            self.log(msg)
 
-    def size(self, price: float, lot_size: int) -> int:
-        """Quantity (in units) that fits inside max_invested including buy charges,
-        and below the exchange's per-order freeze limit."""
+    # ---------------- sizing ----------------
+    def size(self, price: float, lot_size: int, risk_pts: float | None = None) -> int:
+        """Quantity (units) that fits inside max_invested including buy charges, keeps the estimated loss
+        at the stop under max_loss_per_trade, and stays below the exchange's per-order freeze limit."""
+        tr = self.cfg["trade"]
         budget = self.cfg["capital"]["max_invested"]
         lots = math.floor(budget / (price * lot_size))
-        max_qty = self.cfg.get("live", {}).get("max_qty_per_order", 1755)
-        lots = min(lots, max_qty // lot_size)
+        lots = min(lots, self.cfg.get("live", {}).get("max_qty_per_order", 1755) // lot_size)
+        lots = min(lots, tr.get("max_lots", 99))
+        max_loss = tr.get("max_loss_per_trade")
+        if max_loss and risk_pts:
+            delta = self.cfg["orb"].get("delta_guess", 0.6)
+            per_unit = min(risk_pts * delta, price * tr["stop_loss_pct"] / 100)
+            per_unit += price * 2 * self.cfg["paper"]["slippage_pct"] / 100
+            lots = min(lots, math.floor(max_loss / (per_unit * lot_size)))
         while lots > 0:
             qty = lots * lot_size
             cost = price * qty + order_charges(price * qty, "BUY", self.cfg["charges"])
@@ -95,8 +106,7 @@ class Strategy:
 
     def slip(self, price: float, side: str) -> float:
         s = self.cfg["paper"]["slippage_pct"] / 100
-        p = price * (1 + s) if side == "BUY" else price * (1 - s)
-        return round(round(p / 0.05) * 0.05, 2)  # option tick size ₹0.05
+        return tick(price * (1 + s) if side == "BUY" else price * (1 - s))
 
     # ---------------- decisions ----------------
     def can_enter(self, now: datetime) -> bool:
@@ -105,112 +115,63 @@ class Strategy:
                 and self.trades_today < self.cfg["trade"]["max_trades_per_day"]
                 and self._t("no_entry_before") <= t <= self._t("last_entry"))
 
-    def entry_signal(self, now: datetime, index_candles: list[dict],
-                     options: dict[str, tuple[Contract, list[dict]]]) -> tuple[Contract, str] | None:
-        """Called once per closed 1-min candle. options = {"CE": (contract, candles), "PE": (...)}."""
+    def entry_signal(self, now: datetime, index_closed: list[dict]) -> Setup | None:
+        """Called once per finished 1-min candle with Nifty's finished 1-min candles."""
         if not self.can_enter(now):
             return None
-        idx_colour, idx_run = None, 0
-        if index_candles:
-            pts = self._points(index_candles)
-            idx_colour = pts[-1].colour
-            for pt in reversed(pts):  # how many candles has Nifty's line held this colour?
-                if pt.colour != idx_colour:
-                    break
-                idx_run += 1
-        for opt_type in ("CE", "PE"):
-            if opt_type not in options:
-                continue
-            contract, candles = options[opt_type]
-            if len(candles) < self.cfg["indicator"]["length"] + 2:
-                continue
-            last = self._points(candles)[-1]
-            close = candles[-1]["c"]
-            if last.signal != "BUY" or close <= last.line:
-                continue
-            if self.cfg["indicator"]["require_index_agreement"]:
-                need = BLUE if opt_type == "CE" else RED
-                min_run = self.cfg["indicator"].get("index_trend_min_candles", 0)
-                if idx_colour != need or idx_run < min_run:
-                    self.log(f"{now:%H:%M} {contract.symbol}: BUY on option chart but Nifty line is "
-                             f"{idx_colour} for {idx_run} candle(s); needs {need} for {min_run}. Skipped.")
-                    continue
-            reason = (f"{opt_type} line flipped blue, close {close:.2f} above line {last.line:.2f}; "
-                      f"Nifty line {idx_colour} for {idx_run} candles")
-            return contract, reason
-        return None
+        setup, note = find_setup(self.cfg, index_closed, now, self._seen_bars)
+        if note:
+            self.note(note)
+        return setup
 
-    def red_line_exit(self, candles: list[dict]) -> bool:
-        if not (self.position and self.cfg["trade"]["exit_on_red_line"] and candles):
-            return False
-        last = self._points(candles)[-1]
-        return last.colour == RED and candles[-1]["c"] < last.line
+    def index_exit(self, bar: dict) -> str | None:
+        """Nifty-based exit on the latest finished 1-min Nifty candle (stop, breakeven stop, target)."""
+        p = self.position
+        if not p:
+            return None
+        was_moved = p.spot_stop_moved
+        why = spot_exit(self.cfg, p, bar)
+        if p.spot_stop_moved and not was_moved:
+            self.log(f"Nifty reached {p.spot_entry + (1 if p.contract.opt_type == 'CE' else -1) * p.risk_pts:.0f}: "
+                     f"stop moved to the entry level {p.spot_stop:.0f}. This trade can no longer lose much.")
+        return why
 
-    # ---------------- paper fills ----------------
-    def open(self, contract: Contract, market_price: float, now: datetime, reason: str,
+    # ---------------- fills ----------------
+    def open(self, contract: Contract, market_price: float, now: datetime, setup: Setup,
              filled_qty: int | None = None) -> Position | None:
         """Paper: fill at last price plus slippage. Live: pass the real fill price and filled_qty."""
         live = filled_qty is not None
         price = market_price if live else self.slip(market_price, "BUY")
-        qty = filled_qty if live else self.size(price, contract.lot_size)
+        qty = filled_qty if live else self.size(price, contract.lot_size, setup.risk_pts)
+        self.trades_today += 1  # the day's one signal is used up, whatever happens; don't chase
         if qty == 0:
-            self.log(f"{now:%H:%M} Signal on {contract.symbol} but 1 lot at ₹{price} "
-                     f"(x{contract.lot_size}) is more than ₹{self.cfg['capital']['max_invested']}. No trade.")
-            self.trades_today += 1  # the day's one signal is used up; don't chase
+            self.log(f"{now:%H:%M} Signal on {contract.symbol} but even 1 lot at ₹{price} (x{contract.lot_size}) "
+                     f"is over ₹{self.cfg['capital']['max_invested']:,} or risks more than "
+                     f"₹{self.cfg['trade'].get('max_loss_per_trade', 0):,}. No trade today.")
             return None
         tr = self.cfg["trade"]
+        delta = self.cfg["orb"].get("delta_guess", 0.6)
+        stop = tick(price * (1 - tr["stop_loss_pct"] / 100))
         self.position = Position(
             contract=contract, qty=qty, entry_price=price, entry_time=now,
-            target=round(round(price * (1 + tr["target_pct"] / 100) / 0.05) * 0.05, 2),
-            stop=round(round(price * (1 - tr["stop_loss_pct"] / 100) / 0.05) * 0.05, 2),
-            entry_charges=order_charges(price * qty, "BUY", self.cfg["charges"]),
-            reason=reason)
-        self.position.peak = price
-        self.position.initial_stop = self.position.stop
-        self.trades_today += 1
+            target=tick(price + abs(setup.target - setup.spot) * delta), stop=stop,
+            entry_charges=order_charges(price * qty, "BUY", self.cfg["charges"]), reason=setup.reason,
+            peak=price, initial_stop=stop, spot_entry=setup.spot, spot_stop=setup.stop,
+            spot_target=setup.target, risk_pts=setup.risk_pts)
         p = self.position
         self.log(f"{now:%H:%M:%S} {'LIVE' if live else 'PAPER'} BUY {qty} x {contract.symbol} @ ₹{price} "
-                 f"(₹{price * qty:,.0f}). Target ₹{p.target}, stop ₹{p.stop}. Why: {reason}")
+                 f"(₹{price * qty:,.0f}). Exit if Nifty closes {'below' if contract.opt_type == 'CE' else 'above'} "
+                 f"{p.spot_stop:.0f}, book profit at Nifty {p.spot_target:.0f}, safety stop ₹{p.stop}. "
+                 f"Why: {setup.reason}")
         return p
 
-    def update_trail(self, price: float) -> str | None:
-        """Raise the stop as the option rises. Never lowers it. Returns a message if it moved.
-
-        Conservative trailing rule (config [trail]):
-          * up breakeven_at_pct  -> stop moves to the entry price (can't lose on the trade)
-          * after that           -> stop follows trail_pct below the highest price seen
-          * past the target      -> (target_mode = "trail") the gap tightens to tight_trail_pct
-        """
-        p = self.position
-        tr = self.cfg.get("trail", {})
-        if not p or not tr.get("enabled", False):
-            return None
-        p.peak = max(p.peak, price)
-        gain = (p.peak / p.entry_price - 1) * 100
-        new_stop = p.stop
-        if gain >= tr.get("breakeven_at_pct", 5):
-            new_stop = max(new_stop, p.entry_price)
-            gap = tr.get("trail_pct", 7)
-            if gain >= self.cfg["trade"]["target_pct"] and tr.get("target_mode", "exit") == "trail":
-                gap = tr.get("tight_trail_pct", 4)
-            new_stop = max(new_stop, p.peak * (1 - gap / 100))
-        new_stop = round(round(new_stop / 0.05) * 0.05, 2)
-        if new_stop > p.stop + 0.001:
-            old, p.stop = p.stop, new_stop
-            return f"Stop raised ₹{old} -> ₹{new_stop} (high so far ₹{p.peak:.2f}, up {gain:.1f}%)"
-        return None
-
     def check_price(self, ltp: float) -> str | None:
-        """Exit reason if the live price has hit the target or stop, else None."""
+        """Option safety stop: exit if the option price itself has fallen to the stop."""
         p = self.position
-        if not p:
-            return None
-        trail_on = self.cfg.get("trail", {}).get("enabled", False)
-        target_exits = not trail_on or self.cfg["trail"].get("target_mode", "exit") == "exit"
-        if target_exits and ltp >= p.target:
-            return "TARGET"
-        if ltp <= p.stop:
-            return "TRAIL_STOP" if p.stop > p.initial_stop else "STOP_LOSS"
+        if p and ltp <= p.stop:
+            return "OPTION_STOP"
+        if p:
+            p.peak = max(p.peak, ltp)
         return None
 
     def close(self, market_price: float, now: datetime, reason: str, exact: bool = False,
