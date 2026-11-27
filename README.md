@@ -62,6 +62,25 @@ early move tends to carry on into the last half hour.
 - Exit at 15:15, or earlier if Nifty moves 30 points against it. One such trade a day.
 - `"orb+late"` runs the morning breakout and this afternoon trade on the same day (they never overlap).
 
+## TrendIkaterr auto-buy (`name = "ikaterr"` under `[strategy]`)
+
+Paper only, like everything else, until you switch live on yourself. Rules in `[ikaterr]` in config.toml:
+
+* The line is a look-alike of TrendIkaterr (its real formula isn't public): an 11-candle average of Nifty's
+  1-minute closes. BLUE when Nifty is above it and it's rising, RED when below and falling.
+* Line turns BLUE = buy the in-the-money CALL. Line turns RED = buy the in-the-money PUT (`buy_puts = false` for calls only).
+* An alert on every signal, from 09:45 to 14:45, including the ones it doesn't take (and why).
+* Up to ₹30,000 a trade (`max_invested`), one trade at a time, a new trade on every new signal.
+* Stop 7% under the buy price. At +5% the stop moves to the buy price, then follows 7% under the highest
+  price (4% once up 15%). It only moves up. Also sells when the line turns the other colour.
+* Done for the day once the day's profit reaches ₹5,000 (`day_target`) or the loss reaches ₹3,000
+  (`max_daily_loss`), or after 4 losing trades. Everything is sold by 15:15.
+
+**12-month backtest (21 Nov 2025 to 20 Nov 2026, 245 trading days): −₹1,91,503.** 1,088 trades, 24% winners,
+10 of 13 months lost money, the ₹50,000 would have been gone by April 2026. 1-min flips come ~4 times a day, and
+charges plus slippage (~₹250 a round trip on ₹30,000) eat more than the signal earns. The 5-min chart and other
+variants also lost (−₹75k to −₹2.4 lakh). Not recommended for real money.
+
 ## Expiry days
 `skip_expiry_day = false` trades on expiry days too. On those days it uses **next week's** contract
 (`expiry_day_contract = "next"`), because the expiring one can lose most of its value in minutes.

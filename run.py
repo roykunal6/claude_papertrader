@@ -178,7 +178,10 @@ def run_day(cfg: dict, data: dict, day: date, log=print):
                 return [], "skipped: no data for next week's contract"
             expiry = exps[1]
     ch = data["chains"][expiry.isoformat()]
-    chain = [Contract(**dict(c, expiry=date.fromisoformat(c["expiry"]))) for c in ch["contracts"]]
+    from bot.indstocks import sane_lot
+    chain = [Contract(**dict(c, expiry=date.fromisoformat(c["expiry"]),
+                             lot_size=sane_lot(c["lot_size"]) if ch.get("expired") else c["lot_size"]))
+             for c in ch["contracts"]]
     trades = simulate_day(cfg, day, data["index"], ch["candles"], chain, expiry, log=log)
     return trades, "traded" if trades else "no trade (no clean signal)"
 

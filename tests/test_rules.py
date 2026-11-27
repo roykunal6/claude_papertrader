@@ -413,3 +413,105 @@ def test_orb_plus_afternoon_can_take_one_of_each():
                           log=logs.append)
     assert [t.entry_time >= "14:45:00" for t in trades] == [False, True], logs
     assert all(t.opt_type == "CE" for t in trades)
+
+
+# ---------------- TrendIkaterr auto-buy ----------------
+def ik_cfg(**changes):
+    c = cfg()
+    c["strategy"]["name"] = "ikaterr"
+    c["ikaterr"].update(changes)
+    return c
+
+
+def chop_then(move_per_min: float, base: float = 25200.0, n: int = 330) -> list[float]:
+    """45 minutes of small wiggles, then a steady move."""
+    return [base + 3 * math.sin(i / 3) for i in range(45)] + [base + move_per_min * i for i in range(n)]
+
+
+def test_ikaterr_buys_on_signals_and_stops_for_the_day_at_5k_profit():
+    day, idx, opt, contracts, expiry = make_day(path=chop_then(3))
+    trades = simulate_day(ik_cfg(), day, idx, opt, contracts, expiry, log=quiet())
+    assert len(trades) >= 2  # several signals = several trades
+    assert all(t.entry_time >= "09:45" for t in trades)
+    assert all(t.entry_price * t.qty <= 30000 for t in trades)
+    assert trades[-1].exit_reason == "DAY_TARGET" and trades[-1].opt_type == "CE"
+    total = sum(t.net_pnl for t in trades)
+    assert 4500 < total < 5500  # sold at about ₹5,000 for the day (slippage and charges make it a bit under)
+
+
+def test_ikaterr_buys_puts_when_the_line_turns_red_unless_switched_off():
+    day, idx, opt, contracts, expiry = make_day(path=chop_then(-3))
+    trades = simulate_day(ik_cfg(), day, idx, opt, contracts, expiry, log=quiet())
+    assert trades[-1].opt_type == "PE" and trades[-1].exit_reason == "DAY_TARGET"
+    calls_only = simulate_day(ik_cfg(buy_puts=False), day, idx, opt, contracts, expiry, log=quiet())
+    assert all(t.opt_type == "CE" for t in calls_only)
+
+
+def test_ikaterr_red_flip_sells_the_call_and_buys_the_put_on_the_same_candle():
+    base = 25200.0
+    path = [base + 3 * math.sin(i / 3) for i in range(45)] + [base + 1.0 * i for i in range(40)]
+    path += [path[-1] - 1.0 * i for i in range(1, 375 - len(path) + 1)]
+    day, idx, opt, contracts, expiry = make_day(path=path)
+    trades = simulate_day(ik_cfg(day_target=0), day, idx, opt, contracts, expiry, log=quiet())
+    flips = [(a, b) for a, b in zip(trades, trades[1:]) if a.exit_reason == "LINE_FLIP"]
+    assert flips and all(a.exit_time == b.entry_time and a.opt_type != b.opt_type for a, b in flips)
+
+
+def test_ikaterr_daily_loss_limit_sells_and_stops():
+    from bot.instruments import Contract
+    from bot.orb import Setup
+    from bot.strategy import Trade
+    s = Strategy(ik_cfg(max_daily_loss=3000), log=quiet())
+    s.closed.append(Trade("2026-11-19", "X", "CE", 25200, 130, "10:00:00", 100, "10:10:00", 90, "STOP_LOSS",
+                          -1300, 40, -1340, "test"))
+    c = Contract("NFO_1", "NIFTY25200CE", 25200.0, "CE", date(2026, 11, 24), 65)
+    now = datetime(2026, 11, 19, 10, 30, tzinfo=IST)
+    s.open(c, 100.0, now, Setup("CE", 25200, 0, 0, 0, "test", "ikaterr"))
+    p = s.position
+    p.stop = 50.0  # pretend the stop is far away, so only the day's loss limit can trigger
+    reason, px = s.low_exit(80)
+    assert reason == "DAY_LOSS_LIMIT"
+    assert abs(s.day_pnl() + s.open_pnl(px) + 3000) < 30  # sells at about ₹3,000 down for the day
+    s.close(px, now, reason, exact=True)
+    assert not s.can_enter(now) and "loss limit" in s.stop_reason(now)
+
+
+def test_ikaterr_trailing_stop_only_moves_up():
+    from bot.instruments import Contract
+    from bot.orb import Setup
+    s = Strategy(ik_cfg(), log=quiet())
+    c = Contract("NFO_1", "NIFTY25200CE", 25200.0, "CE", date(2026, 11, 24), 65)
+    now = datetime(2026, 11, 19, 10, 0, tzinfo=IST)
+    p = s.open(c, 100.0, now, Setup("CE", 25200, 0, 0, 0, "test", "ikaterr"))
+    assert p and p.qty * p.entry_price <= 30000 and abs(p.stop - p.entry_price * 0.93) < 0.1
+    s.trail(103)
+    assert p.stop < p.entry_price          # up 3%: stop not moved yet
+    s.trail(106)
+    assert p.stop >= p.entry_price         # up 5%+: can't lose any more
+    s.trail(112)
+    assert abs(p.stop - 112 * 0.93) < 0.1  # 7% under the high
+    s.trail(105)
+    assert abs(p.stop - 112 * 0.93) < 0.1  # never moves back down
+    s.trail(120)
+    assert abs(p.stop - 120 * 0.96) < 0.1  # past +15%: 4% under the high
+    assert s.low_exit(115)[0] == "TRAIL_STOP"
+
+
+def test_ikaterr_state_file_keeps_day_pnl_after_a_restart(tmp_path, monkeypatch):
+    from bot import live
+    from bot.strategy import Trade
+    monkeypatch.setattr(live, "ROOT", tmp_path)
+    s = Strategy(ik_cfg(), log=quiet())
+    s.closed.append(Trade("2026-11-19", "X", "CE", 25200, 65, "10:00:00", 100, "10:30:00", 180, "DAY_TARGET",
+                          5200, 50, 5150, "test"))
+    sf = live.StateFile(date(2026, 11, 19))
+    sf.save(s)
+    s2 = Strategy(ik_cfg(), log=quiet())
+    live.StateFile(date(2026, 11, 19)).load(s2)
+    assert s2.day_pnl() == 5150 and not s2.can_enter(datetime(2026, 11, 19, 11, 0, tzinfo=IST))
+
+
+def test_wrong_lot_sizes_from_the_expired_contracts_api_are_fixed():
+    from bot.indstocks import sane_lot
+    assert sane_lot(65) == 65 and sane_lot("75") == 75
+    assert sane_lot(3575) == 65 and sane_lot(150) == 65 and sane_lot(None) == 65
