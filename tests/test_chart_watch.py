@@ -30,6 +30,7 @@ class Quiet:
 
 def trader(prices, **over):
     c = cfg()
+    c["chart_watch"].update({"follow": "nifty", "lots": 0, "max_capital": 30000, "max_trades_per_day": 6})
     c["chart_watch"].update(over)
     contracts = [Contract(f"NFO_{k}{t}", f"NIFTY{k}{t}", float(k), t, EXP, 65)
                  for k in range(25700, 26100, 50) for t in ("CE", "PE")]
@@ -105,3 +106,24 @@ def test_server_takes_readings_from_the_extension():
     assert json.loads(urllib.request.urlopen(req, timeout=5).read())["ok"]
     assert r.state("NIFTY 50") == "BULLISH" and r.state("other") is None
     srv.shutdown()
+
+
+def test_options_mode_buys_each_blue_pane_one_lot_within_20k():
+    from bot.chart_watch import pane_contract_key
+    assert pane_contract_key("NIFTY 01 Dec ₹25850 Call") == (1, "Dec", 25850.0, "CE")
+    assert pane_contract_key("NIFTY 50") is None
+    prices = {"NFO_25850CE": 150.0, "NFO_25850PE": 140.0, "NFO_25900CE": 170.0}
+    tr = trader(prices, follow="options", lots=1, max_capital=20000)
+    call, put, call2 = "NIFTY 01 Dec ₹25850 Call", "NIFTY 01 Dec ₹25850 Put", "NIFTY 01 Dec ₹25900 Call"
+    assert tr.follows(call) and not tr.follows("NIFTY 50")
+    tr.on_change("BEARISH", "BULLISH", None, at("10:00"), pane=call)
+    tr.on_change("BEARISH", "BULLISH", None, at("10:01"), pane=put)
+    assert set(tr.positions) == {call, put} and all(p.qty == 65 for p in tr.positions.values())
+    tr.on_change("BEARISH", "BULLISH", None, at("10:02"), pane=call2)   # 9.8k + 9.1k + 11k > 20k
+    assert call2 not in tr.positions
+    tr.on_change("BULLISH", "BEARISH", None, at("10:30"), pane=call)
+    assert call not in tr.positions and tr.closed[-1].exit_reason == "TREND_FLIP"
+    tr.on_change("BEARISH", "BULLISH", None, at("10:40"), pane=call)    # new blue: second entry same day
+    assert call in tr.positions
+    tr.exit_all(at("15:15"), "TIME_3:15")
+    assert not tr.positions and len(tr.closed) == 3

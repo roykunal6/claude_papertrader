@@ -11,6 +11,7 @@ so a colour that flickers inside a running candle doesn't fire.
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time as _time
 from dataclasses import dataclass
@@ -49,6 +50,10 @@ class Readings:
                     self.panes[name] = {"state": p.get("state"), "value": p.get("value"),
                                         "colour": p.get("colour"), "at": now}
 
+    def pane_names(self) -> list[str]:
+        with self._lock:
+            return list(self.panes)
+
     def state(self, pane: str, max_age: float = 15.0) -> str | None:
         """The pane's state if it was read in the last few seconds, else None."""
         with self._lock:
@@ -68,6 +73,10 @@ def start_server(readings: Readings, port: int, log=print) -> ThreadingHTTPServe
             data = json.dumps(body).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
+            # lets a script on the INDstocks page itself talk to this Mac-only server (no extension needed)
+            self.send_header("Access-Control-Allow-Origin", "https://www.indstocks.com")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Allow-Private-Network", "true")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -81,6 +90,9 @@ def start_server(readings: Readings, port: int, log=print) -> ThreadingHTTPServe
             except (ValueError, json.JSONDecodeError):
                 return self._reply(400, {"ok": False})
             self._reply(200, {"ok": True, "text": readings.status_text})
+
+        def do_OPTIONS(self):  # noqa: N802
+            self._reply(200, {"ok": True})
 
         def do_GET(self):  # noqa: N802
             self._reply(200, {"ok": True, "text": readings.status_text})
@@ -132,7 +144,14 @@ class PaperPosition:
 
 
 class ChartTrader:
-    """Paper-trades the indicator's colour changes on one pane (normally NIFTY 50)."""
+    """Paper-trades TrendIkaterr colour changes.
+
+    follow = "options": every Call/Put pane on the chart is its own signal. A candle closing BLUE on a
+             pane buys that pane's option; RED on that pane sells it. Several trades a day, CE and PE
+             can be held at the same time.
+    follow = "nifty":   only the NIFTY 50 pane. Blue buys an in-the-money call; red sells it
+             (and with on_red = "buy_pe" also buys a put).
+    """
 
     def __init__(self, cfg: dict, contracts: list[Contract], expiry, quote, alert: Alerter, log=print,
                  record=None):
@@ -142,13 +161,25 @@ class ChartTrader:
         self.quote = quote            # quote(scrip) -> last price or None
         self.alert, self.log = alert, log
         self.record = record or (lambda trade: None)
-        self.position: PaperPosition | None = None
+        self.positions: dict[str, PaperPosition] = {}   # pane name -> open paper position
         self.closed: list[Trade] = []
         self.done_for_day = ""
+
+    @property
+    def position(self) -> PaperPosition | None:   # the first open position (handy in nifty mode / tests)
+        return next(iter(self.positions.values()), None)
+
+    def follows(self, pane: str) -> bool:
+        if self.w.get("follow", "nifty") == "options":
+            return pane_contract_key(pane) is not None
+        return pane == self.w["pane"]
 
     # ---- rules
     def day_pnl(self) -> float:
         return sum(t.net_pnl for t in self.closed)
+
+    def invested(self) -> float:
+        return sum(p.entry_price * p.qty for p in self.positions.values())
 
     def can_enter(self, now: datetime) -> str:
         """'' if a new trade is allowed, else the reason why not."""
@@ -159,79 +190,104 @@ class ChartTrader:
             return self.done_for_day
         if now.time() < hhmm(w["no_entry_before"]) or now.time() > hhmm(w["last_entry"]):
             return f"outside buying hours ({w['no_entry_before']} to {w['last_entry']})"
-        if len(self.closed) + (1 if self.position else 0) >= w["max_trades_per_day"]:
+        if len(self.closed) + len(self.positions) >= w["max_trades_per_day"]:
             return f"already {w['max_trades_per_day']} trades today"
         return ""
 
     def _check_day_limits(self) -> None:
         w, pnl = self.w, self.day_pnl()
         losers = sum(1 for t in self.closed if t.net_pnl < 0)
-        if pnl >= w["daily_profit_stop"]:
+        if self.done_for_day:
+            return
+        if w.get("daily_profit_stop") and pnl >= w["daily_profit_stop"]:
             self.done_for_day = f"day profit ₹{pnl:,.0f} reached the ₹{w['daily_profit_stop']:,} goal"
-        elif pnl <= -w["daily_loss_stop"]:
+        elif w.get("daily_loss_stop") and pnl <= -w["daily_loss_stop"]:
             self.done_for_day = f"day loss ₹{-pnl:,.0f} hit the ₹{w['daily_loss_stop']:,} limit"
-        elif losers >= w["max_losing_trades"]:
+        elif w.get("max_losing_trades") and losers >= w["max_losing_trades"]:
             self.done_for_day = f"{losers} losing trades today"
         if self.done_for_day:
             self.alert.send("🛑 Done for today", f"No more buys today: {self.done_for_day}.", speak="Done for today.")
 
+    def _contract_for(self, pane: str, new: str, spot: float | None) -> Contract | None:
+        if self.w.get("follow", "nifty") == "options":
+            key = pane_contract_key(pane)
+            if not key:
+                return None
+            day, mon, strike, typ = key
+            for c in self.contracts:
+                if (c.opt_type == typ and abs(c.strike - strike) < 0.01 and c.expiry.day == day
+                        and c.expiry.strftime("%b").lower() == mon.lower()):
+                    return c
+            self.log(f"Couldn't find the contract for '{pane}' in the instrument list.")
+            return None
+        want = "CE" if new == "BULLISH" else "PE"
+        if not spot:
+            self.log("Not buying: couldn't get the Nifty price.")
+            return None
+        k = pick_strike(spot, want, self.cfg["trade"]["strike_step"], self.cfg["trade"].get("strike_mode", "itm"))
+        return pick(self.contracts, self.expiry, k, want)
+
     # ---- events
-    def on_change(self, old: str, new: str, spot: float | None, now: datetime) -> None:
-        pane = self.w["pane"]
+    def on_change(self, old: str, new: str, spot: float | None, now: datetime, pane: str | None = None) -> None:
+        pane = pane or self.w["pane"]
+        options = self.w.get("follow", "nifty") == "options"
         self.alert.send(f"{'🔵' if new == 'BULLISH' else '🔴' if new == 'BEARISH' else '🟢'} TrendIkaterr turned "
                         f"{STATE_WORDS.get(new, new)}",
                         f"{pane} on your chart: {STATE_WORDS.get(old, old)} → {STATE_WORDS.get(new, new)} "
                         f"(1-min candle closed {now - timedelta(minutes=1):%H:%M}).",
                         speak=f"Trend ikaterr {'blue' if new == 'BULLISH' else 'red' if new == 'BEARISH' else 'green'}.")
-        p = self.position
-        if p and ((p.contract.opt_type == "CE" and new == "BEARISH") or (p.contract.opt_type == "PE" and new == "BULLISH")):
-            self.exit(now, "TREND_FLIP")
-        want = "CE" if new == "BULLISH" else "PE" if (new == "BEARISH" and self.w.get("on_red") == "buy_pe") else None
-        if not want or self.position:
+        p = self.positions.get(pane)
+        if p and (new == "BEARISH" if (options or p.contract.opt_type == "CE") else new == "BULLISH"):
+            self.exit(now, "TREND_FLIP", pane=pane)
+        if options:
+            buy = new == "BULLISH"
+        else:
+            buy = new == "BULLISH" or (new == "BEARISH" and self.w.get("on_red") == "buy_pe")
+        if not buy or pane in self.positions:
             return
         why_not = self.can_enter(now)
         if why_not:
             self.log(f"Not buying: {why_not}.")
             return
-        if not spot:
-            self.log("Not buying: couldn't get the Nifty price.")
-            return
-        k = pick_strike(spot, want, self.cfg["trade"]["strike_step"], self.cfg["trade"].get("strike_mode", "itm"))
-        c = pick(self.contracts, self.expiry, k, want)
+        c = self._contract_for(pane, new, spot)
         ltp = self.quote(c.scrip) if c else None
         if not ltp:
-            self.log(f"Not buying: no price for NIFTY {k:.0f} {want}.")
+            self.log(f"Not buying: no price for {pane}.")
             return
         price = tick(ltp * (1 + self.cfg["paper"]["slippage_pct"] / 100))
-        lots = min(int(self.cfg["capital"]["max_invested"] // (price * c.lot_size)), self.cfg["trade"]["max_lots"])
-        if lots < 1:
-            self.alert.send("⚠️ No trade", f"1 lot of {contract_label(c)} (₹{price * c.lot_size:,.0f}) is more than "
-                            f"₹{self.cfg['capital']['max_invested']:,}.")
+        cap = self.w.get("max_capital", self.cfg["capital"]["max_invested"])
+        room = cap - self.invested()
+        lots = self.w.get("lots", 0) or min(int(room // (price * c.lot_size)), self.cfg["trade"]["max_lots"])
+        if lots < 1 or price * c.lot_size * lots > room:
+            self.alert.send("⚠️ No trade", f"Blue on {contract_label(c)}, but {lots or 1} lot (₹{price * c.lot_size * max(lots, 1):,.0f}) "
+                            f"would take the money in use over ₹{cap:,} (₹{self.invested():,.0f} already in trades).")
             return
         qty = lots * c.lot_size
         stop = tick(price * (1 - self.w["stop_pct"] / 100))
-        self.position = PaperPosition(c, qty, price, now, order_charges(price * qty, "BUY", self.cfg["charges"]),
-                                      price, stop)
+        self.positions[pane] = PaperPosition(c, qty, price, now, order_charges(price * qty, "BUY", self.cfg["charges"]),
+                                             price, stop)
         self.alert.send("🟢 PAPER BUY", f"{contract_label(c)}: {lots} lot(s), qty {qty}, at ₹{price} "
                         f"(₹{price * qty:,.0f}). Stop ₹{stop}, trailing {self.w['trail_pct']}% behind the best price. "
                         "Sells when TrendIkaterr turns red, at the stop, or at "
                         f"{self.cfg['timing']['square_off']}. Not a real order.",
-                        speak=f"Paper buy. Nifty {c.strike:.0f} {'call' if want == 'CE' else 'put'}.")
+                        speak=f"Paper buy. Nifty {c.strike:.0f} {'call' if c.opt_type == 'CE' else 'put'}.")
 
-    def on_price(self, ltp: float, now: datetime) -> None:
-        p = self.position
+    def on_price(self, ltp: float | None, now: datetime, pane: str | None = None) -> None:
+        pane = pane or next(iter(self.positions), None)
+        p = self.positions.get(pane) if pane else None
         if not p or not ltp:
             return
         if ltp > p.peak:
             p.peak = ltp
             p.stop = max(p.stop, tick(p.peak * (1 - self.w["trail_pct"] / 100)))
         if now.time() >= hhmm(self.cfg["timing"]["square_off"]):
-            self.exit(now, "TIME_3:15", ltp)
+            self.exit(now, "TIME_3:15", ltp, pane=pane)
         elif ltp <= p.stop:
-            self.exit(now, "TRAIL_STOP" if p.stop > p.entry_price else "OPTION_STOP", ltp)
+            self.exit(now, "TRAIL_STOP" if p.stop > p.entry_price else "OPTION_STOP", ltp, pane=pane)
 
-    def exit(self, now: datetime, reason: str, ltp: float | None = None) -> Trade | None:
-        p = self.position
+    def exit(self, now: datetime, reason: str, ltp: float | None = None, pane: str | None = None) -> Trade | None:
+        pane = pane or next(iter(self.positions), None)
+        p = self.positions.pop(pane, None) if pane else None
         if not p:
             return None
         ltp = ltp or self.quote(p.contract.scrip) or p.entry_price
@@ -242,8 +298,7 @@ class ChartTrader:
                   strike=p.contract.strike, qty=p.qty, entry_time=f"{p.entry_time:%H:%M:%S}",
                   entry_price=p.entry_price, exit_time=f"{now:%H:%M:%S}", exit_price=price, exit_reason=reason,
                   gross_pnl=gross, charges=charges, net_pnl=round(gross - charges, 2),
-                  entry_reason="TrendIkaterr colour change on the INDstocks chart")
-        self.position = None
+                  entry_reason="TrendIkaterr turned blue on the INDstocks chart")
         self.closed.append(t)
         self.record(t)
         why = {"TREND_FLIP": "TrendIkaterr changed colour", "TRAIL_STOP": "trailing stop hit, profit locked",
@@ -255,6 +310,21 @@ class ChartTrader:
         self._check_day_limits()
         return t
 
+    def exit_all(self, now: datetime, reason: str) -> None:
+        for pane in list(self.positions):
+            self.exit(now, reason, pane=pane)
+
+
+_PANE_RE = re.compile(r"(\d{1,2})\s+([A-Za-z]{3})\s+₹?\s*([\d,]+(?:\.\d+)?)\s+(Call|Put)\b", re.I)
+
+
+def pane_contract_key(pane: str):
+    """'NIFTY 01 Dec ₹25850 Call' -> (1, 'Dec', 25850.0, 'CE'); None for panes that aren't an option."""
+    m = _PANE_RE.search(pane or "")
+    if not m:
+        return None
+    return int(m.group(1)), m.group(2), float(m.group(3).replace(",", "")), "CE" if m.group(4).lower() == "call" else "PE"
+
 
 # ---------------------------------------------------------------- the day's loop
 def run_watch(cfg: dict) -> None:
@@ -265,6 +335,7 @@ def run_watch(cfg: dict) -> None:
     from .market import load_contracts
 
     w = cfg["chart_watch"]
+    options = w.get("follow", "nifty") == "options"
     today = datetime.now(IST).date()
     log = Journal(today)
     log("=" * 70)
@@ -282,7 +353,7 @@ def run_watch(cfg: dict) -> None:
     if not contracts or not expiry:
         log("Couldn't load Nifty option contracts. Stopping.")
         return
-    log(f"Loaded {len(contracts)} Nifty option contracts; buying expiry {expiry}.")
+    log(f"Loaded {len(contracts)} Nifty option contracts.")
 
     alert = Alerter(cfg, log)
 
@@ -294,14 +365,14 @@ def run_watch(cfg: dict) -> None:
             return None
 
     trader = ChartTrader(cfg, contracts, expiry, quote, alert, log, record=lambda t: append_trade(t, "paper-chart"))
-    tracker = BarCloseTracker()
-    pane, idx = w["pane"], cfg["api"]["index_scrip"]
+    trackers: dict[str, BarCloseTracker] = {}
+    idx = cfg["api"]["index_scrip"]
     square_off = hhmm(cfg["timing"]["square_off"])
     stop_file = Path(__file__).resolve().parent.parent / "STOP"
-    alert.send("✅ Watching the real TrendIkaterr",
-               f"Open the INDstocks chart in Chrome and keep that window visible. I act on the {pane} pane: "
-               f"blue = paper buy a call{', red = paper buy a put' if w.get('on_red') == 'buy_pe' else ', red = sell'}.")
-    last_warn, last_state, said_seen = 0.0, None, False
+    what = ("every Call and Put chart: blue = paper buy that option (1 lot), red = sell it" if options else
+            f"the {w['pane']} chart: blue = paper buy a call, red = sell")
+    alert.send("✅ Watching the real TrendIkaterr", f"Keep the INDstocks chart open and visible in Chrome. I follow {what}.")
+    last_warn, last_states, said_seen = 0.0, {}, False
     open_t, close_t = hhmm("09:15"), (datetime.combine(today, square_off) + timedelta(minutes=2)).time()
 
     while True:
@@ -309,40 +380,45 @@ def run_watch(cfg: dict) -> None:
         if now.time() >= close_t:
             break
         if stop_file.exists():
-            log("STOP file found: closing any paper position and stopping.")
-            trader.exit(now, "MANUAL_STOP")
+            log("STOP file found: closing any paper positions and stopping.")
+            trader.exit_all(now, "MANUAL_STOP")
             break
-        state = readings.state(pane)
-        # ---- tell the extension what we see, for its on-chart badge
-        p = trader.position
-        readings.status_text = (f"Bot connected · paper · {pane}: {STATE_WORDS.get(state, state or 'not seen')}"
-                                + (f" · holding {contract_label(p.contract)}" if p else "")
+        panes = [n for n in readings.pane_names() if trader.follows(n)]
+        states = {n: readings.state(n) for n in panes}
+        seen = {n: s for n, s in states.items() if s}
+        readings.status_text = ("Bot connected · paper · " + (" · ".join(f"{n}: {STATE_WORDS.get(s, s)}" for n, s in seen.items())
+                                                             or "TrendIkaterr not seen yet")
+                                + (f" · holding {', '.join(contract_label(p.contract) for p in trader.positions.values())}"
+                                   if trader.positions else "")
                                 + (f" · day P&L ₹{trader.day_pnl():,.0f}" if trader.closed else ""))
-        if state and not said_seen:
+        if seen and not said_seen:
             said_seen = True
-            alert.send("👀 Chart connected", f"I can see TrendIkaterr on {pane}: {STATE_WORDS.get(state, state)}.")
-        if state and state != last_state:
-            log(f"{pane} live colour now {STATE_WORDS.get(state, state)} (acts when the candle closes).")
-            last_state = state
+            alert.send("👀 Chart connected", "I can see TrendIkaterr on: "
+                       + ", ".join(f"{n} {STATE_WORDS.get(s, s)}" for n, s in seen.items()) + ".")
+        for n, s in seen.items():
+            if s != last_states.get(n):
+                log(f"{n} live colour now {STATE_WORDS.get(s, s)} (acts when the candle closes).")
+                last_states[n] = s
         # ---- warn if the chart stopped talking during market hours
         gap = readings.seconds_since_contact()
-        silent = gap is None or gap > 60 or (state is None and not readings.hovering)
+        silent = gap is None or gap > 60 or (not seen and not readings.hovering)
         if open_t <= now.time() < square_off and silent and _time.time() - last_warn > 300:
             last_warn = _time.time()
             alert.send("⚠️ Can't see the chart",
-                       "Open indstocks.com/app/flash in Chrome with TRENDIKATERR on the Nifty 50 chart, keep the window "
+                       "Open indstocks.com/app/flash in Chrome with TRENDIKATERR on the charts, keep the window "
                        "visible (not minimised) and move the mouse off the chart.", speak="Check the chart window.")
-        # ---- act on closed candles
-        change = tracker.feed(state, now)
-        if change:
-            spot = quote(idx) if change[1] in ("BULLISH", "BEARISH") else None
-            trader.on_change(change[0], change[1], spot, now)
-        if trader.position:
-            trader.on_price(quote(trader.position.contract.scrip), now)
+        # ---- act on closed candles, pane by pane
+        for n in set(panes) | set(trackers):
+            change = trackers.setdefault(n, BarCloseTracker()).feed(states.get(n), now)
+            if change:
+                spot = quote(idx) if not options and change[1] in ("BULLISH", "BEARISH") else None
+                trader.on_change(change[0], change[1], spot, now, pane=n)
+        for n, p in list(trader.positions.items()):
+            trader.on_price(quote(p.contract.scrip), now, pane=n)
         _time.sleep(1)
 
-    if trader.position:
-        trader.exit(datetime.now(IST), "TIME_3:15")
+    trader.exit_all(datetime.now(IST), "TIME_3:15")
     n = len(trader.closed)
-    alert.send("📊 Day summary", f"{n} paper trade(s) on TrendIkaterr today, P&L ₹{trader.day_pnl():,.0f} after charges."
-               if n else "No paper trades today.")
+    wins = sum(1 for t in trader.closed if t.net_pnl > 0)
+    alert.send("📊 Day summary", f"{n} paper trade(s) on TrendIkaterr today ({wins} won), P&L ₹{trader.day_pnl():,.0f} "
+               "after charges." if n else "No paper trades today.")

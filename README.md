@@ -152,9 +152,10 @@ Nothing is re-built: whatever TrendIkaterr shows on your screen is what the bot 
    the chart. Chrome stops updating hidden pages; the bot warns you if it can't see the chart for a minute.
 
 **What it does** (rules under `[chart_watch]` in `config.toml`)
-- When a 1-minute candle closes **blue** after red/green: alert (pop-up, voice, Telegram) and a **paper** buy
-  of the in-the-money Nifty call, up to ₹30,000.
-- When a candle closes **red**: alert and paper sell. Set `on_red = "buy_pe"` to also paper-buy a put.
+- `follow = "options"` (default): every Call and Put chart on screen is its own signal. When a 1-minute candle
+  closes **blue** on one, alert (pop-up, voice, Telegram) and a **paper** buy of that option, 1 lot. When it
+  closes **red**, paper sell. Several trades a day; never more than ₹20,000 in open trades at once.
+- `follow = "nifty"`: only the Nifty 50 chart; blue buys an in-the-money call, red sells it.
 - Also sells at a 20% stop, a 20% trailing stop, or 15:15. Stops buying for the day at ₹5,000 profit,
   ₹3,000 loss or 4 losing trades. Set `auto_buy = false` for alerts only.
 - Paper trades go into `trades.csv` with mode `paper-chart`. **No real orders**: live trading from the chart
