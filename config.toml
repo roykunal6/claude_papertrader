@@ -83,6 +83,27 @@ mac_popup = true         # pop-up with a sound on your Mac
 mac_voice = true         # your Mac says "Buy now" / "Sell now" out loud
 # Telegram: put TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env (see README)
 
+[chart_watch]
+# python run.py watch : alerts + PAPER trades from the REAL TrendIkaterr on your INDstocks chart
+# (read live by the Chrome extension in chart_watcher/). Nothing re-built, no real orders.
+# "options": every Call and Put chart on screen is its own signal: blue = buy that option, red = sell it.
+# "nifty":   follow only the pane below: blue = buy an in-the-money call, red = sell.
+follow = "options"
+pane = "NIFTY 50"           # (nifty mode) which chart pane to follow
+lots = 1                    # always buy this many lots (0 = as many as max_capital allows)
+max_capital = 20000         # never more than this much money in open trades at once (₹)
+auto_buy = true             # false = alerts only, no paper trades
+on_red = "exit"             # (nifty mode) "exit": red only sells the call. "buy_pe": red also paper-buys a put
+no_entry_before = "09:20"
+last_entry = "14:45"
+max_trades_per_day = 20
+stop_pct = 20               # sell if the option falls 20% from the buy price...
+trail_pct = 20              # ...or 20% from its best price since the buy (locks in profit)
+daily_profit_stop = 5000    # no more buys today after this much profit (₹)
+daily_loss_stop = 3000      # no more buys today after this much loss (₹)
+max_losing_trades = 4
+port = 8765                 # the extension talks to http://127.0.0.1:8765 on this Mac only
+
 [live]
 # REAL MONEY. Leave this false until you've watched paper trading for a while.
 # Even when true, the bot only trades live if you run `python run.py live`

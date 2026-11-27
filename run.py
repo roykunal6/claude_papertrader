@@ -2,6 +2,8 @@
 
   python run.py check                 test your API token and data access
   python run.py paper                 run today's live paper trading (start before 09:15)
+  python run.py watch                 alerts + paper trades from the REAL TrendIkaterr on your chart
+                                      (needs the Chrome extension in chart_watcher/, see README)
   python run.py live                  REAL MONEY: same rules, places real orders (needs [live] enabled = true)
   python run.py live-check            read-only: your public IP, funds and open positions, before going live
   python run.py replay 2026-11-19     replay a past day with the same rules
@@ -562,6 +564,9 @@ def main(argv: list[str]) -> None:
         cmd_debug_expired(cfg, date.fromisoformat(argv[2]))
     elif cmd == "export" and len(argv) > 2:
         cmd_export(cfg, date.fromisoformat(argv[2]), argv[3:5] if len(argv) > 4 else None)
+    elif cmd == "watch":
+        from bot.chart_watch import run_watch
+        run_watch(cfg)
     elif cmd == "live":
         cmd_live(cfg)
     elif cmd == "live-check":
