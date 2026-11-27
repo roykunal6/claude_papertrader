@@ -10,6 +10,8 @@ max_invested = 30000   # the bot never spends more than this on one trade
 # "trend" = Trend-following: only in a clear trend, up to 3 trades a day, trailing stop, no fixed target.
 # "late"  = Afternoon momentum only: one trade at 14:45 if the morning and afternoon moves agree, out by 15:15.
 # "orb+late" = both: the breakout in the morning, plus the afternoon trade.
+# "ikaterr" = TrendIkaterr auto-buy: buy every time the trend line turns blue, trailing stop,
+#             done for the day at ₹5,000 profit or ₹3,000 loss. Rules are in [ikaterr] below.
 # Run  python run.py compare 12months  to see how each one did on the same days before you choose.
 name = "orb"
 
@@ -77,6 +79,26 @@ min_afternoon_pct = 0.05    # and the afternoon move must point the same way, at
 stop_pts = 30               # exit early if Nifty moves this many points against the trade
 breakeven_r = 99            # (no breakeven or trailing: it's a 30-minute trade)
 trail_r = 0
+
+[ikaterr]
+# TrendIkaterr auto-buy. The line is a look-alike (TrendIkaterr's real formula isn't public):
+# an 11-candle average of Nifty, BLUE when Nifty is above it and it's rising, RED when below and falling.
+length = 11
+timeframe_min = 1           # draw the line on Nifty's 1-min candles (5 = 5-min candles, fewer signals)
+buy_puts = true             # line turns RED = buy the in-the-money PUT. false = only buy CALLs on BLUE
+no_entry_before = "09:45"
+last_entry = "14:45"        # no new trades after this; everything is sold at 15:15
+max_trades_per_day = 10     # one trade at a time; a new signal after the last trade ended is a new trade
+# Spend per trade: max_invested in [capital] (₹30,000).
+stop_pct = 7                # stop: sell if the option falls 7% below what we paid (about ₹2,100 on ₹30,000)
+breakeven_at_pct = 5        # once up 5%, the stop moves up to what we paid
+trail_pct = 7               # then it follows 7% below the highest price so far, and never moves down
+tight_after_pct = 15        # once up 15%...
+tight_trail_pct = 4         # ...it follows 4% below the high (no fixed target: the stop keeps moving up)
+exit_on_flip = true         # also sell when the line turns the other colour
+day_target = 5000           # once today's profit (sold trades + the open one) reaches ₹5,000: sell, stop for the day
+max_daily_loss = 3000       # once today's loss reaches ₹3,000: sell, stop for the day (6% of ₹50,000)
+max_losing_trades_per_day = 4   # and stop after 4 losing trades in a day
 
 [alerts]
 mac_popup = true         # pop-up with a sound on your Mac

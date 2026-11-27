@@ -194,6 +194,19 @@ def expired_expiries(client: "IndstocksClient", underlying: str, start, end) -> 
     return sorted(out)
 
 
+NIFTY_LOTS = (25, 50, 65, 75)  # every Nifty lot size NSE has used
+
+
+def sane_lot(lot) -> int:
+    """The expired-contracts API often returns a wrong lot_size (seen: 150, 1600, 3575, 6975...).
+    Anything that isn't a real Nifty lot size is replaced by today's 65."""
+    try:
+        n = int(float(lot))
+    except (TypeError, ValueError):
+        return 65
+    return n if n in NIFTY_LOTS else 65
+
+
 def expired_contracts(client: "IndstocksClient", underlying: str, expiry) -> list:
     """The full option chain of an expired expiry, as Contract objects.
     scrip is "EXP:<trading_symbol>" so it can't be mixed up with a live code."""
@@ -215,7 +228,7 @@ def expired_contracts(client: "IndstocksClient", underlying: str, expiry) -> lis
             strike = float(_field(r, "strike_price", "strike", "STRIKE_PRICE"))
             lot = r.get("lot_size") or r.get("LOT_UNITS") or r.get("lotSize") or 65
             out.append(Contract(scrip=f"EXP:{sym}", symbol=sym, strike=strike, opt_type=opt,
-                                expiry=expiry, lot_size=int(float(lot))))
+                                expiry=expiry, lot_size=sane_lot(lot)))
         except (KeyError, TypeError, ValueError):
             continue
     return out

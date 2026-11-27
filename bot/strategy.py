@@ -15,7 +15,7 @@ from datetime import datetime
 
 from .costs import order_charges
 from .instruments import Contract
-from . import late, orb, trend
+from . import ikaterr, late, orb, trend
 from .orb import IST, Setup, hhmm, spot_exit
 
 __all__ = ["IST", "Position", "Strategy", "Trade", "hhmm"]
@@ -130,28 +130,59 @@ class Strategy:
         used = self.part_trades.get(part, 0)
         if part == "late":
             return used < 1 and late.in_window(self.cfg, t)
-        limit = self.cfg.get(part, {}).get("max_trades_per_day", tr["max_trades_per_day"])
-        return used < limit and self._t("no_entry_before") <= t <= self._t("last_entry")
+        sec = self.cfg.get(part, {})
+        limit = sec.get("max_trades_per_day", tr["max_trades_per_day"])
+        start = hhmm(sec["no_entry_before"]) if "no_entry_before" in sec else self._t("no_entry_before")
+        end = hhmm(sec["last_entry"]) if "last_entry" in sec else self._t("last_entry")
+        return used < limit and start <= t <= end
 
     def use_signal(self, kind: str) -> None:
         self.trades_today += 1
         self.part_trades[kind] = self.part_trades.get(kind, 0) + 1
 
-    def can_enter(self, now: datetime) -> bool:
+    def limit(self, key: str, default=None):
+        """A day limit: the TrendIkaterr section's own value when that strategy is on, else [trade]'s."""
+        if "ikaterr" in self.parts() and key in self.cfg.get("ikaterr", {}):
+            return self.cfg["ikaterr"][key]
+        return self.cfg["trade"].get(key, default)
+
+    @property
+    def every_minute(self) -> bool:
+        """TrendIkaterr looks at every 1-min candle (the others only at 5-min closes), and may buy again
+        on the same candle that closed the last trade (a CALL closed on a RED flip, then the PUT bought)."""
+        return "ikaterr" in self.parts()
+
+    def stop_reason(self, now: datetime) -> str | None:
+        """Why no new trade can start now, in plain words (None = a new trade is allowed)."""
         t = now.astimezone(IST).time()
-        tr = self.cfg["trade"]
         losses = sum(1 for x in self.closed if x.net_pnl <= 0)
-        return (self.position is None and not self.blocked
-                and losses < tr.get("max_losing_trades_per_day", 99)
-                and self.day_pnl() > -tr.get("max_daily_loss", 10**9)
-                and any(self._part_open(p, t) for p in self.parts()))
+        if self.position is not None:
+            return "a trade is already open"
+        if self.blocked:
+            return "the safety checks stopped trading today"
+        done = next((x.exit_reason for x in self.closed if x.exit_reason in ("DAY_TARGET", "DAY_LOSS_LIMIT")), None)
+        if done:
+            return "today's " + ("profit target" if done == "DAY_TARGET" else "loss limit") + " was reached, done for the day"
+        target = self.limit("day_target", 0)
+        if target and self.day_pnl() >= target:
+            return f"today's profit target of ₹{target:,} is reached"
+        if self.day_pnl() <= -self.limit("max_daily_loss", 10**9):
+            return f"today's loss limit of ₹{self.limit('max_daily_loss'):,} is reached"
+        if losses >= self.limit("max_losing_trades_per_day", 99):
+            return f"{losses} losing trades today, the limit"
+        if not any(self._part_open(p, t) for p in self.parts()):
+            return "outside trading hours or the day's trade count is used up"
+        return None
+
+    def can_enter(self, now: datetime) -> bool:
+        return self.stop_reason(now) is None
 
     def entry_signal(self, now: datetime, index_closed: list[dict]) -> Setup | None:
         """Called once per finished 5-min candle with Nifty's finished 1-min candles."""
         if not self.can_enter(now):
             return None
         t = now.astimezone(IST).time()
-        mods = {"orb": orb, "trend": trend, "late": late}
+        mods = {"orb": orb, "trend": trend, "late": late, "ikaterr": ikaterr}
         for part in self.parts():
             if not self._part_open(part, t):
                 continue
@@ -167,6 +198,10 @@ class Strategy:
         """Nifty-based exit on the latest finished 1-min Nifty candle (stop, trailing stop, target, trend end)."""
         p = self.position
         if not p:
+            return None
+        if p.kind == "ikaterr":
+            if index_closed and now and ikaterr.flipped_against(self.cfg, p, index_closed, now):
+                return "LINE_FLIP"
             return None
         before = p.spot_stop
         why = spot_exit(self.cfg, p, bar, p.kind)
@@ -188,11 +223,12 @@ class Strategy:
         if qty == 0:
             self.log(f"{now:%H:%M} Signal on {contract.symbol} but even 1 lot at ₹{price} (x{contract.lot_size}) "
                      f"is over ₹{self.cfg['capital']['max_invested']:,} or risks more than "
-                     f"₹{self.cfg['trade'].get('max_loss_per_trade', 0):,}. No trade today.")
+                     f"₹{self.cfg['trade'].get('max_loss_per_trade', 0):,}. Not taken.")
             return None
         tr = self.cfg["trade"]
         delta = self.cfg["trade"].get("delta_guess", 0.6)
-        stop = tick(price * (1 - tr["stop_loss_pct"] / 100))
+        stop_pct = self.cfg["ikaterr"]["stop_pct"] if setup.kind == "ikaterr" else tr["stop_loss_pct"]
+        stop = tick(price * (1 - stop_pct / 100))
         self.position = Position(
             contract=contract, qty=qty, entry_price=price, entry_time=now,
             target=tick(price + abs(setup.target - setup.spot) * delta) if setup.target else 0.0, stop=stop,
@@ -200,13 +236,80 @@ class Strategy:
             peak=price, initial_stop=stop, spot_entry=setup.spot, spot_stop=setup.stop,
             spot_target=setup.target, risk_pts=setup.risk_pts, spot_best=setup.spot, kind=setup.kind)
         p = self.position
-        self.log(f"{now:%H:%M:%S} {'LIVE' if live else 'PAPER'} BUY {qty} x {contract.symbol} @ ₹{price} "
-                 f"(₹{price * qty:,.0f}). Exit if Nifty closes {'below' if contract.opt_type == 'CE' else 'above'} "
-                 f"{p.spot_stop:.0f} (trailing), "
-                 + (f"book profit at Nifty {p.spot_target:.0f}, " if p.spot_target else "")
-                 + f"safety stop ₹{p.stop}. "
-                 f"Why: {setup.reason}")
+        tag = "LIVE" if live else "PAPER"
+        if setup.kind == "ikaterr":
+            self.log(f"{now:%H:%M:%S} {tag} BUY {qty} x {contract.symbol} @ ₹{price} (₹{price * qty:,.0f}). "
+                     f"Stop ₹{p.stop}, and it moves up as the price rises. Why: {setup.reason}")
+        else:
+            self.log(f"{now:%H:%M:%S} {tag} BUY {qty} x {contract.symbol} @ ₹{price} "
+                     f"(₹{price * qty:,.0f}). Exit if Nifty closes {'below' if contract.opt_type == 'CE' else 'above'} "
+                     f"{p.spot_stop:.0f} (trailing), "
+                     + (f"book profit at Nifty {p.spot_target:.0f}, " if p.spot_target else "")
+                     + f"safety stop ₹{p.stop}. Why: {setup.reason}")
         return p
+
+    # ---------------- TrendIkaterr: exits on the option price ----------------
+    def open_pnl(self, price: float) -> float:
+        """Profit of the open trade if sold at `price` now, after both orders' charges."""
+        p = self.position
+        if not p:
+            return 0.0
+        return (price - p.entry_price) * p.qty - p.entry_charges - order_charges(price * p.qty, "SELL", self.cfg["charges"])
+
+    def _price_for_day_pnl(self, level: float) -> float:
+        """Option price at which today's total P&L (closed + open) would be `level`."""
+        p = self.position
+        need = level - self.day_pnl()
+        price = p.entry_price + (need + p.entry_charges) / p.qty
+        for _ in range(2):  # the sell charges depend on the price
+            price = p.entry_price + (need + p.entry_charges
+                                     + order_charges(max(price, 0.05) * p.qty, "SELL", self.cfg["charges"])) / p.qty
+        return price
+
+    def trail(self, high: float) -> str | None:
+        """Push the stop up behind the highest price so far. Never lowers it. Returns a message if it moved."""
+        p = self.position
+        ik = self.cfg["ikaterr"]
+        p.peak = max(p.peak, high)
+        gain = (p.peak / p.entry_price - 1) * 100
+        new = p.stop
+        if gain >= ik["breakeven_at_pct"]:
+            gap = ik["tight_trail_pct"] if gain >= ik["tight_after_pct"] else ik["trail_pct"]
+            new = max(new, p.entry_price, p.peak * (1 - gap / 100))
+        new = tick(new)
+        if new > p.stop + 0.001:
+            old, p.stop = p.stop, new
+            return f"Stop raised ₹{old} -> ₹{new} (high so far ₹{p.peak:.2f}, up {gain:.1f}%)"
+        return None
+
+    def low_exit(self, low: float) -> tuple[str, float] | None:
+        """(reason, trigger price) if the price fell to the stop or to today's loss limit."""
+        p = self.position
+        loss_px = self._price_for_day_pnl(-self.limit("max_daily_loss", 10**9))
+        if low <= p.stop and p.stop >= loss_px:
+            return ("TRAIL_STOP" if p.stop > p.entry_price + 0.001 else
+                    "BREAKEVEN_STOP" if p.stop >= p.entry_price - 0.001 else "STOP_LOSS"), p.stop
+        if low <= loss_px:
+            return "DAY_LOSS_LIMIT", tick(max(loss_px, 0.05))
+        return None
+
+    def high_exit(self, high: float) -> tuple[str, float] | None:
+        """(reason, trigger price) if today's profit reached the day target."""
+        target = self.limit("day_target", 0)
+        if not target:
+            return None
+        px = self._price_for_day_pnl(target)
+        return ("DAY_TARGET", tick(px)) if high >= px else None
+
+    def ikaterr_tick(self, ltp: float) -> str | None:
+        """Live: called every second with the option's last price. Returns an exit reason or None."""
+        why = self.low_exit(ltp) or self.high_exit(ltp)
+        if why:
+            return why[0]
+        msg = self.trail(ltp)
+        if msg:
+            self.log(msg)
+        return None
 
     def check_price(self, ltp: float) -> str | None:
         """Option safety stop: exit if the option price itself has fallen to the stop."""
