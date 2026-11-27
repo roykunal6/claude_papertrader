@@ -133,6 +133,33 @@ python run.py demo                # made-up day, no internet or token needed
 python -m pytest -q               # run the rule tests
 ```
 
+## Alerts and paper trades from the REAL TrendIkaterr on your chart
+
+INDstocks charts have no alerts, and TrendIkaterr isn't a public TradingView script, so a TradingView
+webhook can't see it. Instead, a small Chrome extension reads the indicator's colour straight off your
+open INDstocks chart (blue = bullish, red = bearish, green = recovery) and tells the bot on your Mac.
+Nothing is re-built: whatever TrendIkaterr shows on your screen is what the bot acts on.
+
+**One-time setup (2 minutes)**
+1. In Chrome open `chrome://extensions`, switch on **Developer mode** (top right).
+2. Click **Load unpacked** and pick the `chart_watcher` folder inside this project.
+
+**Every trading day**
+1. In Terminal: `cd ~/Desktop/Github/claude_papertrader && source .venv/bin/activate && python run.py watch`
+2. In Chrome open `indstocks.com/app/flash` with **TRENDIKATERR** on the Nifty 50 chart (1-minute).
+   A green badge appears at the bottom-left: `TrendIkaterr watcher · NIFTY 50: 🔵 BULLISH · Bot connected`.
+3. Keep that Chrome window visible (not minimised, not hidden behind a full-screen app) and the mouse off
+   the chart. Chrome stops updating hidden pages; the bot warns you if it can't see the chart for a minute.
+
+**What it does** (rules under `[chart_watch]` in `config.toml`)
+- When a 1-minute candle closes **blue** after red/green: alert (pop-up, voice, Telegram) and a **paper** buy
+  of the in-the-money Nifty call, up to ₹30,000.
+- When a candle closes **red**: alert and paper sell. Set `on_red = "buy_pe"` to also paper-buy a put.
+- Also sells at a 20% stop, a 20% trailing stop, or 15:15. Stops buying for the day at ₹5,000 profit,
+  ₹3,000 loss or 4 losing trades. Set `auto_buy = false` for alerts only.
+- Paper trades go into `trades.csv` with mode `paper-chart`. **No real orders**: live trading from the chart
+  is not switched on.
+
 ## Going live (real money)
 
 Do this only after paper trading has looked right for a while. You can go back to paper at any time.
